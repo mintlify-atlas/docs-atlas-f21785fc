@@ -1,0 +1,241 @@
+---
+title: 'Normalization layers'
+description: 'RMS normalization, layer normalization, and group normalization for neural network training and inference.'
+keywords: ['rms norm', 'layer norm', 'group norm', 'normalization', 'batch norm']
+---
+
+Meganeura provides both high-level `nn::` structs for common normalization patterns and low-level `Graph` ops for direct use in custom architectures.
+
+---
+
+## `nn::RmsNorm`
+
+RMS normalization: scales the input by the inverse RMS, then multiplies element-wise by a learned weight.
+
+Formula: `y = x / sqrt(mean(x²) + eps) * weight`
+
+**Fields**
+
+<ParamField path="weight" type="NodeId" required>
+  Scale parameter of shape `[dim]`.
+</ParamField>
+
+<ParamField path="eps" type="f32" required>
+  Small constant added to the denominator for numerical stability.
+</ParamField>
+
+### `RmsNorm::new`
+
+<ParamField path="g" type="&mut Graph" required>
+  The computation graph to register the parameter into.
+</ParamField>
+
+<ParamField path="name" type="&str" required>
+  Name for the weight parameter.
+</ParamField>
+
+<ParamField path="dim" type="usize" required>
+  Feature dimension (last dimension of the input).
+</ParamField>
+
+<ParamField path="eps" type="f32" required>
+  Stability epsilon (e.g. `1e-5` or `1e-6`).
+</ParamField>
+
+```rust
+let norm = nn::RmsNorm::new(&mut g, "model.layers.0.input_layernorm.weight", 512, 1e-5);
+```
+
+### `forward`
+
+<ParamField path="g" type="&mut Graph" required>
+  The computation graph to append ops to.
+</ParamField>
+
+<ParamField path="x" type="NodeId" required>
+  2D input tensor of shape `[seq, dim]`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Normalized output tensor of shape `[seq, dim]`.
+</ResponseField>
+
+```rust
+let norm = nn::RmsNorm::new(&mut g, "rms", 512, 1e-5);
+let y = norm.forward(&mut g, x);
+// y shape: [seq, 512]
+```
+
+---
+
+## `nn::LayerNorm`
+
+Layer normalization with both a learned scale (`weight`) and a learned shift (`bias`).
+
+Formula: `y = (x - mean(x)) / sqrt(var(x) + eps) * weight + bias`
+
+**Fields**
+
+<ParamField path="weight" type="NodeId" required>
+  Scale parameter of shape `[dim]`. Registered as `{name}.weight`.
+</ParamField>
+
+<ParamField path="bias" type="NodeId" required>
+  Shift parameter of shape `[dim]`. Registered as `{name}.bias`.
+</ParamField>
+
+<ParamField path="eps" type="f32" required>
+  Small constant added to the variance for numerical stability.
+</ParamField>
+
+### `LayerNorm::new`
+
+<ParamField path="g" type="&mut Graph" required>
+  The computation graph to register parameters into.
+</ParamField>
+
+<ParamField path="name" type="&str" required>
+  Name prefix. Registers `{name}.weight` and `{name}.bias`.
+</ParamField>
+
+<ParamField path="dim" type="usize" required>
+  Feature dimension (last dimension of the input).
+</ParamField>
+
+<ParamField path="eps" type="f32" required>
+  Stability epsilon (e.g. `1e-5`).
+</ParamField>
+
+```rust
+let norm = nn::LayerNorm::new(&mut g, "encoder.layer_norm", 768, 1e-5);
+```
+
+### `forward`
+
+<ParamField path="g" type="&mut Graph" required>
+  The computation graph to append ops to.
+</ParamField>
+
+<ParamField path="x" type="NodeId" required>
+  2D input tensor of shape `[seq, dim]`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Normalized output tensor of shape `[seq, dim]`.
+</ResponseField>
+
+```rust
+let norm = nn::LayerNorm::new(&mut g, "ln", 768, 1e-5);
+let y = norm.forward(&mut g, x);
+// y shape: [seq, 768]
+```
+
+---
+
+## Graph normalization ops
+
+### `g.rms_norm`
+
+Applies RMS normalization directly.
+
+<ParamField path="x" type="NodeId" required>
+  2D input tensor of shape `[seq, dim]`.
+</ParamField>
+
+<ParamField path="weight" type="NodeId" required>
+  1D weight tensor of shape `[dim]`.
+</ParamField>
+
+<ParamField path="eps" type="f32" required>
+  Stability epsilon.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Normalized tensor of shape `[seq, dim]`.
+</ResponseField>
+
+```rust
+let w = g.parameter("rms_w", &[512]);
+let y = g.rms_norm(x, w, 1e-5);
+```
+
+### `g.layer_norm`
+
+Applies standard layer normalization.
+
+<ParamField path="x" type="NodeId" required>
+  2D input tensor of shape `[seq, dim]`.
+</ParamField>
+
+<ParamField path="weight" type="NodeId" required>
+  1D scale tensor of shape `[dim]`.
+</ParamField>
+
+<ParamField path="bias" type="NodeId" required>
+  1D shift tensor of shape `[dim]`.
+</ParamField>
+
+<ParamField path="eps" type="f32" required>
+  Stability epsilon.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Normalized tensor of shape `[seq, dim]`.
+</ResponseField>
+
+```rust
+let w = g.parameter("ln.weight", &[768]);
+let b = g.parameter("ln.bias", &[768]);
+let y = g.layer_norm(x, w, b, 1e-5);
+```
+
+### `g.group_norm`
+
+Group normalization over a flat NCHW tensor. Divides the `channels` dimension into `num_groups` groups, each normalized independently.
+
+<ParamField path="x" type="NodeId" required>
+  Flat 1D input tensor representing `[N, C, H, W]` in NCHW order (total size `N*C*H*W`).
+</ParamField>
+
+<ParamField path="weight" type="NodeId" required>
+  Scale parameter of shape `[C]`.
+</ParamField>
+
+<ParamField path="bias" type="NodeId" required>
+  Shift parameter of shape `[C]`.
+</ParamField>
+
+<ParamField path="batch" type="u32" required>
+  Batch size `N`.
+</ParamField>
+
+<ParamField path="channels" type="u32" required>
+  Number of channels `C`. Must be divisible by `num_groups`.
+</ParamField>
+
+<ParamField path="spatial" type="u32" required>
+  Spatial size `H * W`.
+</ParamField>
+
+<ParamField path="num_groups" type="u32" required>
+  Number of groups to divide channels into.
+</ParamField>
+
+<ParamField path="eps" type="f32" required>
+  Stability epsilon.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Normalized flat tensor of the same shape as the input.
+</ResponseField>
+
+```rust
+let w = g.parameter("gn.weight", &[64]);
+let b = g.parameter("gn.bias", &[64]);
+// x is flat [N * 64 * 32 * 32]
+let y = g.group_norm(x, w, b, batch, 64, 32 * 32, 32, 1e-5);
+```
+
+<Note>
+  During inference optimization, the compiler may automatically fuse adjacent `GroupNorm` + `SiLU` sequences into a single `GroupNormSilu` kernel. This fusion is applied transparently and does not require changes to your graph construction code.
+</Note>

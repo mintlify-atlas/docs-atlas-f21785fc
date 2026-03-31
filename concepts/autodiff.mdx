@@ -1,0 +1,191 @@
+---
+title: "Automatic differentiation"
+description: "How Meganeura uses reverse-mode automatic differentiation to append a backward pass to your forward computation graph."
+keywords: ["autodiff", "automatic differentiation", "backpropagation", "differentiate", "gradients", "backward"]
+---
+
+Meganeura uses **reverse-mode automatic differentiation** (backpropagation) to compute gradients. Rather than executing gradient computations at runtime, `differentiate()` statically appends backward nodes to the graph at build time. The resulting graph contains both the forward and backward passes as a single static compute sequence.
+
+## The differentiate() function
+
+```rust
+pub fn differentiate(forward: &Graph) -> Graph
+```
+
+`differentiate()` takes a forward graph that ends in a scalar loss and returns a new graph containing:
+
+1. All original forward nodes (copied verbatim).
+2. New gradient nodes appended after the forward nodes.
+3. An updated output list: `[loss, grad_param_0, grad_param_1, ...]` — one gradient output per `Parameter` node, in the order they appear in the forward graph.
+
+The function iterates over forward nodes in reverse topological order, propagating gradients using the chain rule. When multiple forward paths contribute gradients to the same node (e.g. a shared weight used in two matmuls), the gradients are accumulated with `Add`:
+
+```rust
+fn accumulate_grad(
+    graph: &mut Graph,
+    grads: &mut HashMap<NodeId, NodeId>,
+    node: NodeId,
+    grad: NodeId,
+) {
+    match grads.get(&node) {
+        Some(&existing) => {
+            let sum = graph.add(existing, grad);
+            grads.insert(node, sum);
+        }
+        None => {
+            grads.insert(node, grad);
+        }
+    }
+}
+```
+
+## Gradient rules
+
+Each `Op` has a corresponding gradient rule. Here are the most important ones:
+
+<AccordionGroup>
+  <Accordion title="MatMul">
+    For `C = A @ B`:
+    - `dA = dC @ B^T` → `MatMulBT(dC, B)`
+    - `dB = A^T @ dC` → `MatMulAT(A, dC)`
+  </Accordion>
+  <Accordion title="FusedMatMulAdd">
+    For `C = A @ B + D`:
+    - Same `dA` and `dB` as `MatMul`, plus `dD = dC` (passthrough).
+    The gradient of the addend passes straight through.
+  </Accordion>
+  <Accordion title="BiasAdd">
+    For `out = input + bias` (broadcast):
+    - `d_input = d_out`
+    - `d_bias = SumRows(d_out)` — column sums of the upstream gradient.
+  </Accordion>
+  <Accordion title="RmsNorm">
+    For `y = RmsNorm(x, w, eps)`:
+    - `d_w` → `RmsNormGradW(dy, x, w)` — exact formula: `sum_i(dy[i,j] * x[i,j] * rsqrt_i)`
+    - `d_x` → `RmsNormGradX(dy, x, w)` — exact formula: `rsqrt_i * (dy[i,j]*w[j] - x[i,j]*s_i)`
+  </Accordion>
+  <Accordion title="SwiGLU">
+    For `out = silu(gate) * up`:
+    - `d_gate` → `SwiGLUGradGate(d_out, gate, up)`
+    - `d_up`   → `SwiGLUGradUp(d_out, gate)`
+  </Accordion>
+  <Accordion title="SwiGLUConcat">
+    For `out[M,N] = silu(input[:,:N]) * input[:,N:]`:
+    - `d_input` → `SwiGLUConcatGrad(d_out, input)` — produces `[M, 2*N]`.
+  </Accordion>
+  <Accordion title="Silu">
+    `d_x` → `SiluGrad(d_out, x)` — computes `d/dx silu(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))`.
+  </Accordion>
+  <Accordion title="MultiHeadAttn">
+    For `O = MultiHeadAttn(Q, K, V)`, three separate gradient nodes are emitted:
+    - `d_Q` → `MultiHeadAttnGradQ(dO, Q, K, V)` (references the forward node id for the LSE buffer)
+    - `d_K` → `MultiHeadAttnGradK(dO, Q, K, V)`
+    - `d_V` → `MultiHeadAttnGradV(dO, Q, K, V)`
+  </Accordion>
+  <Accordion title="CrossEntropyLoss">
+    `d_logits = softmax(logits) - labels`
+  </Accordion>
+  <Accordion title="Relu">
+    `d_x = d_out * (x > 0)` — uses a `Greater` node to create the mask.
+  </Accordion>
+  <Accordion title="MeanAll">
+    `d_x = (1/N)` broadcast to the shape of `x` — emitted as a constant tensor.
+  </Accordion>
+  <Accordion title="Embedding">
+    `d_table` → `ScatterAdd(indices, d_out, vocab_size)` — accumulates gradient rows by index.
+  </Accordion>
+  <Accordion title="Conv2d">
+    - `d_input`  → `Conv2dGradInput(d_out, kernel)`
+    - `d_kernel` → `Conv2dGradWeight(d_out, input)`
+  </Accordion>
+</AccordionGroup>
+
+<Note>
+  `Input` nodes, `Constant` nodes, and inference-only ops (`RoPE`, `CausalAttention`, `LayerNorm`, `CacheWrite`, etc.) do not accumulate gradients. Calling `differentiate()` on a graph containing inference-only ops emits a log warning and leaves those ops without gradients.
+</Note>
+
+## Autodiff runs on the optimized graph
+
+A critical detail: `differentiate()` is called on the **optimized** forward graph, not the original one. This means the backward pass differentiates through fused ops like `SwiGLUConcat` and `FusedMatMulAdd` directly, rather than re-deriving them from their unfused components.
+
+If you call `differentiate()` on an unoptimized graph, the optimizer still runs on the full graph afterward and will fuse the backward matmuls, but you will not benefit from `SwiGLUConcat` on the forward pass.
+
+## The full pipeline
+
+<Steps>
+  <Step title="Build the forward graph">
+    Construct your model ending in a scalar loss and call `set_outputs()`.
+  </Step>
+  <Step title="Optimize the forward graph">
+    ```rust
+    let optimized_forward = meganeura::optimize::optimize(&forward_graph);
+    ```
+    This fuses `SwiGLU`, `MatMul+Add`, and other patterns before differentiation.
+  </Step>
+  <Step title="Toposort">
+    ```rust
+    let sorted = optimized_forward.toposort();
+    ```
+    The optimizer may have appended nodes out of order; toposort restores dependency order.
+  </Step>
+  <Step title="Differentiate">
+    ```rust
+    let full_graph = meganeura::autodiff::differentiate(&sorted);
+    ```
+    The returned graph has outputs `[loss, grad_w1, grad_b1, grad_w2, ...]`.
+  </Step>
+  <Step title="Optimize the full graph">
+    ```rust
+    let (optimized, report) = meganeura::optimize::optimize_with_report(&full_graph);
+    ```
+    This second pass fuses backward `MatMulBT+Add` patterns and similar opportunities.
+  </Step>
+  <Step title="Compile">
+    ```rust
+    let plan = meganeura::compile::compile(&optimized);
+    ```
+  </Step>
+</Steps>
+
+All six steps are wrapped by `build_session_with_report()`. Call `compile_training_graph()` to run the pipeline up to step 6 (exclusive of GPU session creation) in environments without a GPU:
+
+```rust
+use meganeura::compile_training_graph;
+
+let mut g = Graph::new();
+let x  = g.input("x",      &[4, 3]);
+let w  = g.parameter("w",  &[3, 2]);
+let y  = g.matmul(x, w);
+let loss = g.mean_all(y);
+g.set_outputs(vec![loss]);
+
+let (plan, report) = compile_training_graph(&g);
+println!("dispatches: {}", plan.dispatches.len());
+println!("param/grad pairs: {}", plan.param_grad_pairs.len());
+println!("{}", report);
+```
+
+<Warning>
+  `compile_training_graph` skips the forward-graph optimization step (it calls `differentiate` on the raw graph). For production use, prefer `build_session_with_report` which runs the full two-pass pipeline.
+</Warning>
+
+## Gradient outputs and parameter alignment
+
+The output list produced by `differentiate()` has a fixed structure:
+
+```
+outputs = [loss_node, grad_param_0, grad_param_1, ..., grad_param_N]
+```
+
+Every `Parameter` node in the forward graph gets exactly one gradient output, in the same positional order. If the optimizer fused a parameter away (marking it `Nop`), a scalar zero placeholder is emitted so that the positional mapping stays intact for `compile.rs` to build `param_grad_pairs`.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="GPU execution" icon="microchip" href="/concepts/gpu-execution">
+    How the compiled plan is executed on GPU hardware.
+  </Card>
+  <Card title="Trainers and optimizers" icon="play" href="/training/trainers-and-optimizers">
+    How to use SGD and Adam with a compiled training session.
+  </Card>
+</CardGroup>

@@ -1,0 +1,224 @@
+---
+title: "Data loading"
+description: "Feed training data to a session using DataLoader and MnistDataset."
+keywords: ["DataLoader", "MnistDataset", "batch", "shuffle", "data pipeline", "MNIST"]
+---
+
+Meganeura's data loading primitives keep all data in CPU memory as flat `f32` slices and yield mini-batches on demand. The `DataLoader` handles shuffling, batching, and epoch reset. `MnistDataset` parses the MNIST IDX format from disk.
+
+## DataLoader
+
+`DataLoader` iterates over an in-memory dataset in mini-batches:
+
+```rust
+pub struct DataLoader {
+    // flat f32 data: n * sample_size elements
+    // flat f32 labels: n * label_size elements
+    batch_size: usize,
+    // ...
+}
+```
+
+Data is stored as row-major flat arrays. Each call to `next_batch()` gathers `batch_size` samples into contiguous scratch buffers according to the current permutation.
+
+### Creating a loader from raw tensors
+
+```rust
+use meganeura::DataLoader;
+
+let n = 3200;
+let input_dim = 784;
+let classes = 10;
+let batch = 32;
+
+// n * input_dim elements
+let images: Vec<f32> = (0..n * input_dim)
+    .map(|i| ((i % 256) as f32) / 255.0)
+    .collect();
+
+// n * classes elements, one-hot encoded
+let mut labels = vec![0.0_f32; n * classes];
+for b in 0..n {
+    labels[b * classes + (b % classes)] = 1.0;
+}
+
+let mut loader = DataLoader::new(images, labels, input_dim, classes, batch);
+```
+
+`DataLoader::new` accepts:
+- `data` — all samples concatenated; length must equal `n * sample_size`
+- `labels` — all labels concatenated; length must equal `n * label_size`
+- `sample_size` — number of floats per sample
+- `label_size` — number of floats per label
+- `batch_size` — samples per mini-batch
+
+<Warning>
+The dataset must contain at least `batch_size` samples. `DataLoader::new` panics if `n < batch_size`.
+</Warning>
+
+### Iterating batches
+
+Call `next_batch()` in a loop. It returns `None` when fewer than `batch_size` samples remain (the partial last batch is dropped):
+
+```rust
+while let Some(batch) = loader.next_batch() {
+    session.set_input("x", batch.data);
+    session.set_input("labels", batch.labels);
+    session.step();
+    session.wait();
+}
+```
+
+`Batch` borrows internal scratch buffers valid until the next call to `next_batch`, `shuffle`, or `reset`:
+
+```rust
+pub struct Batch<'a> {
+    pub data: &'a [f32],    // batch_size * sample_size elements
+    pub labels: &'a [f32],  // batch_size * label_size elements
+}
+```
+
+### Shuffling and resetting
+
+Shuffle the sample order before each epoch. Pass the epoch index as a seed so every epoch uses a different permutation:
+
+```rust
+loader.shuffle(epoch as u64);
+loader.reset();
+```
+
+`shuffle` uses Fisher-Yates with a lightweight LCG PRNG. `reset` moves the position cursor back to the start without changing the order.
+
+<Tip>
+`Trainer::train_epoch` calls `loader.shuffle(epoch as u64)` and `loader.reset()` automatically. You only need to call these explicitly when managing the loop yourself.
+</Tip>
+
+### Utility methods
+
+| Method | Returns | Description |
+|---|---|---|
+| `loader.len()` | `usize` | Total number of samples |
+| `loader.num_batches()` | `usize` | Number of complete batches per epoch |
+| `loader.is_empty()` | `bool` | Whether the dataset has zero samples |
+
+---
+
+## MnistDataset
+
+`MnistDataset` loads the MNIST handwritten digit dataset from the standard IDX binary format. Images are flattened to `[N, 784]` and normalized to `[0, 1]`. Labels are one-hot encoded to `[N, 10]`.
+
+```rust
+pub struct MnistDataset {
+    pub images: Vec<f32>,  // shape [n, 784], values in [0, 1]
+    pub labels: Vec<f32>,  // shape [n, 10], one-hot
+    pub n: usize,
+}
+```
+
+### Loading from disk
+
+```rust
+use meganeura::MnistDataset;
+use std::path::Path;
+
+// Gzip-compressed files (the common download format)
+let mnist = MnistDataset::load_gz(
+    Path::new("data/train-images-idx3-ubyte.gz"),
+    Path::new("data/train-labels-idx1-ubyte.gz"),
+)?;
+
+// Or raw uncompressed IDX files
+let mnist = MnistDataset::load(
+    Path::new("data/train-images-idx3-ubyte"),
+    Path::new("data/train-labels-idx1-ubyte"),
+)?;
+
+println!("loaded {} images", mnist.n);
+```
+
+Both methods return `io::Result<MnistDataset>`. Download the standard MNIST files from [yann.lecun.com/exdb/mnist](https://yann.lecun.com/exdb/mnist/).
+
+### Converting to a DataLoader
+
+Call `.loader(batch_size)` to consume the dataset and produce a `DataLoader`:
+
+```rust
+let mut loader = mnist.loader(32);  // batch_size = 32
+```
+
+This is equivalent to calling `DataLoader::new(mnist.images, mnist.labels, 784, 10, batch_size)`.
+
+---
+
+## Custom datasets
+
+You can wire up any data source by loading it into flat `Vec<f32>` arrays and passing them to `DataLoader::new`. The following example from `examples/mnist.rs` shows how to create a synthetic dataset when real data is unavailable:
+
+```rust
+fn synthetic_loader(n: usize, input_dim: usize, classes: usize, batch: usize) -> DataLoader {
+    let images: Vec<f32> = (0..n * input_dim)
+        .map(|i| ((i % 256) as f32) / 255.0)
+        .collect();
+    let mut labels = vec![0.0_f32; n * classes];
+    for b in 0..n {
+        labels[b * classes + (b % classes)] = 1.0;
+    }
+    DataLoader::new(images, labels, input_dim, classes, batch)
+}
+```
+
+For multi-modal or image datasets:
+
+<Steps>
+  <Step title="Preprocess all samples offline">
+    Load images, tokenize text, or run feature extraction. Store the result as a flat `Vec<f32>` where each sample occupies `sample_size` contiguous elements.
+  </Step>
+  <Step title="Encode labels as floats">
+    One-hot encode classification labels, or use raw regression targets. Each label must occupy exactly `label_size` contiguous floats.
+  </Step>
+  <Step title="Create the loader">
+    Pass both flat arrays to `DataLoader::new` with the correct `sample_size`, `label_size`, and `batch_size`.
+  </Step>
+  <Step title="Wire input names to your graph">
+    Set `TrainConfig::data_input` and `TrainConfig::label_input` to match the names you used in `g.input(...)`. The default names are `"x"` and `"labels"`.
+  </Step>
+</Steps>
+
+---
+
+## Complete data loading example
+
+The following pattern from `examples/mnist.rs` handles both real and synthetic data gracefully:
+
+```rust
+fn load_mnist_or_synthetic(batch: usize, input_dim: usize, classes: usize) -> DataLoader {
+    let data_dir = Path::new("data");
+    let gz_images = data_dir.join("train-images-idx3-ubyte.gz");
+    let gz_labels = data_dir.join("train-labels-idx1-ubyte.gz");
+    let raw_images = data_dir.join("train-images-idx3-ubyte");
+    let raw_labels = data_dir.join("train-labels-idx1-ubyte");
+
+    if gz_images.exists() && gz_labels.exists() {
+        let mnist = MnistDataset::load_gz(&gz_images, &gz_labels)
+            .expect("failed to parse MNIST gz files");
+        return mnist.loader(batch);
+    }
+
+    if raw_images.exists() && raw_labels.exists() {
+        let mnist = MnistDataset::load(&raw_images, &raw_labels)
+            .expect("failed to parse MNIST files");
+        return mnist.loader(batch);
+    }
+
+    // Fall back to deterministic synthetic data
+    let n = 3200;
+    let images: Vec<f32> = (0..n * input_dim)
+        .map(|i| ((i % 256) as f32) / 255.0)
+        .collect();
+    let mut labels = vec![0.0_f32; n * classes];
+    for b in 0..n {
+        labels[b * classes + (b % classes)] = 1.0;
+    }
+    DataLoader::new(images, labels, input_dim, classes, batch)
+}
+```

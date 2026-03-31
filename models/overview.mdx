@@ -1,0 +1,97 @@
+---
+title: 'Built-in models'
+description: 'Meganeura ships four GPU-accelerated models ready to use: a language model, a vision-language model, a vision-language-action model, and a diffusion U-Net.'
+keywords: ['models', 'smollm2', 'smolvlm2', 'smolvla', 'stable diffusion', 'unet']
+---
+
+Meganeura provides four built-in models in `src/models/`. Each model exposes a `build_graph` (or equivalent) function that registers the full computation graph into a `Graph` instance. You then compile that graph, load weights, and run inference or training — all on the GPU.
+
+<CardGroup cols={2}>
+  <Card title="SmolLM2" icon="message" href="/models/smollm2">
+    Decoder-only transformer language model with GQA, RoPE, RMSNorm, and SwiGLU. Includes a 135M preset and KV-cache graphs for efficient autoregressive decoding.
+  </Card>
+  <Card title="SmolVLM2" icon="image" href="/models/smolvlm2">
+    Vision-language model combining a SigLIP-style ViT encoder with a LLaMA-3-variant text decoder. A pixel-shuffle connector bridges vision and text.
+  </Card>
+  <Card title="SmolVLA" icon="robot" href="/models/overview">
+    Vision-language-action model for robotics. Extends SmolVLM2 with an action expert that alternates self-attention over action tokens and cross-attention to VLM hidden states.
+  </Card>
+  <Card title="Stable Diffusion UNet" icon="wand-magic-sparkles" href="/models/stable-diffusion">
+    SD 1.5-compatible U-Net for denoising diffusion. Encoder/decoder with ResBlocks, GroupNorm, SiLU, and skip connections. Includes a training benchmark with MSE loss.
+  </Card>
+</CardGroup>
+
+## Common pattern
+
+All built-in models follow the same four-step pattern:
+
+<Steps>
+  <Step title="Define a config">
+    Instantiate the model's config struct, either using a built-in preset or by setting fields manually.
+
+    ```rust
+    let config = SmolLM2Config::smollm2_135m();
+    ```
+  </Step>
+  <Step title="Build the graph">
+    Call the model's `build_graph` function, passing a mutable `Graph` reference and the config. The function registers all parameters and ops and returns the output `NodeId`.
+
+    ```rust
+    let mut g = Graph::new();
+    let logits = smollm2::build_graph(&mut g, &config, seq_len);
+    g.set_outputs(vec![logits]);
+    ```
+  </Step>
+  <Step title="Compile and load weights">
+    Compile the graph into a `Session`, then load HuggingFace-compatible safetensors weights. Linear layer weights stored in `[out, in]` order must be transposed on load; each model provides a `transposed_weight_names` helper for this.
+
+    ```rust
+    let mut session = build_inference_session(&g);
+    // load weights using SafeTensorsModel::download(REPO_ID)
+    for (name, _) in session.plan().param_buffers.clone() {
+        let data = model.tensor_f32_auto(&name)?;
+        session.set_parameter(&name, &data);
+    }
+    ```
+  </Step>
+  <Step title="Run inference">
+    Set inputs, call `session.step()`, wait for the GPU to finish, and read the output.
+
+    ```rust
+    session.set_input_u32("token_ids", &tokens);
+    session.step();
+    session.wait();
+    let logits = session.read_output(seq_len * vocab_size);
+    ```
+  </Step>
+</Steps>
+
+## HuggingFace-compatible parameter names
+
+Every built-in model uses the same parameter naming convention as the corresponding HuggingFace safetensors checkpoint. For example, SmolLM2 registers:
+
+```
+model.embed_tokens.weight
+model.layers.0.input_layernorm.weight
+model.layers.0.self_attn.q_proj.weight
+...
+model.norm.weight
+lm_head.weight
+```
+
+This means you can load weights directly from HuggingFace Hub using `SafeTensorsModel::download(REPO_ID)` without any name remapping.
+
+<Note>
+HuggingFace stores linear layer weights in `[out_features, in_features]` order, but Meganeura's `matmul` op expects `[in_features, out_features]`. Each model provides a `transposed_weight_names` function that returns the list of tensors that must be transposed on load.
+</Note>
+
+## Module layout
+
+```
+src/models/
+├── mod.rs         — re-exports all four model modules
+├── smollm2.rs     — SmolLM2 (LLM)
+├── smolvlm2.rs    — SmolVLM2 (VLM) + VisionConfig + TextConfig
+├── smolvla.rs     — SmolVLA (VLA action expert)
+└── sd_unet.rs     — Stable Diffusion U-Net
+```

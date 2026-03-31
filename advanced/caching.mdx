@@ -1,0 +1,109 @@
+---
+title: "Execution plan caching"
+description: "Skip autodiff, egglog optimization, and compilation on repeated runs by caching the ExecutionPlan to disk."
+keywords: ["caching", "execution plan", "build_session_cached", "RON", "cache invalidation"]
+---
+
+Building a training session involves three expensive steps: automatic differentiation, equality-saturation optimization with egglog, and kernel compilation. For large models, these steps can take several seconds. Execution plan caching lets you skip all three on subsequent runs by saving the compiled `ExecutionPlan` to disk and reloading it when the graph is unchanged.
+
+<Note>
+  The cache stores the compiled `ExecutionPlan` — the buffer layout and GPU dispatch sequence — **not** the model weights. You still need to call `session.set_parameter(...)` to load weights after building from cache.
+</Note>
+
+## Using `build_session_cached`
+
+Replace `build_session` with `build_session_cached` and pass a path for the cache file:
+
+```rust
+use std::path::Path;
+use meganeura::{Graph, build_session_cached};
+
+// Build your forward graph as normal.
+let mut g = Graph::new();
+let x = g.input("x", &[4, 784]);
+let w1 = g.parameter("w1", &[784, 128]);
+let b1 = g.parameter("b1", &[128]);
+let mm1 = g.matmul(x, w1);
+let h1 = g.bias_add(mm1, b1);
+let a1 = g.relu(h1);
+let w2 = g.parameter("w2", &[128, 10]);
+let b2 = g.parameter("b2", &[10]);
+let mm2 = g.matmul(a1, w2);
+let logits = g.bias_add(mm2, b2);
+let labels = g.input("labels", &[4, 10]);
+let loss = g.cross_entropy_loss(logits, labels);
+g.set_outputs(vec![loss]);
+
+// First run: compiles and saves the plan.
+// Subsequent runs: loads from cache if the graph is unchanged.
+let mut session = build_session_cached(&g, Path::new("model.plan.ron"));
+```
+
+On the **first run**, `build_session_cached` runs the full pipeline (autodiff → optimize → compile) and saves the resulting `ExecutionPlan` to `model.plan.ron`. On **subsequent runs**, it reads the file, checks the graph hash, and — if the graph is unchanged — skips straight to `Session::new`. The compile time reported in the [benchmarks](/advanced/benchmarking) table is `0 s` because Meganeura always caches after the first build.
+
+## How cache invalidation works
+
+The cache stores a fingerprint of your forward graph alongside the plan. The fingerprint hashes:
+
+- The number of nodes in the graph
+- The operation type at each node (`matmul`, `relu`, `parameter`, etc.)
+- The input edges of each node
+- The tensor shape at each node
+- The name of every `Parameter` and `Input` node
+- The graph output list
+
+If any of these change — different shapes, renamed parameters, added/removed layers — the hash will not match and `build_session_cached` will recompile and overwrite the cache. A log message is emitted when this happens:
+
+```
+cache invalidated: graph hash mismatch
+```
+
+If the cache file does not exist yet, the function silently runs the full pipeline.
+
+## Cache file format
+
+The cache is serialized as a [RON](https://github.com/ron-rs/ron) (Rusty Object Notation) text file. RON is a human-readable format structurally similar to Rust expressions. The file contains a `CachedPlan` struct with two fields:
+
+```
+CachedPlan(
+    graph_hash: 12345678901234567,
+    plan: ExecutionPlan(
+        buffers: [...],
+        dispatches: [...],
+        ...
+    ),
+)
+```
+
+You can inspect or version-control this file, though it is large for non-trivial models. It is safe to delete — `build_session_cached` will simply recompile.
+
+## Lower-level cache functions
+
+If you need finer control, you can call the cache functions directly from the `meganeura::cache` module:
+
+```rust
+use meganeura::cache;
+use std::path::Path;
+
+// Save a compiled plan to disk (paired with the graph it was compiled from).
+cache::save_plan(&plan, &forward_graph, Path::new("my_plan.ron")).unwrap();
+
+// Load a cached plan — returns None if the file is missing or the hash mismatches.
+if let Some(plan) = cache::load_plan(&forward_graph, Path::new("my_plan.ron")).unwrap() {
+    let session = meganeura::runtime::Session::new(plan);
+    // use session...
+}
+```
+
+`save_plan` computes the graph hash and writes it alongside the `ExecutionPlan` in RON format. `load_plan` returns `Ok(None)` for a missing file (not an error), and `Err(...)` only for a corrupt or unreadable file.
+
+## What is and is not cached
+
+| Cached | Not cached |
+|--------|-----------|
+| Buffer layout (sizes, dtypes) | Model weights (`set_parameter` data) |
+| GPU dispatch sequence | Input data |
+| Kernel indices and workgroup sizes | Optimizer state (Adam moments) |
+| Fused op selections | GPU device objects (recreated in `Session::new`) |
+
+The cache is purely a compilation artifact. Weights are stored separately — in memory while training, or in checkpoint files you manage yourself.

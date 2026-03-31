@@ -1,0 +1,552 @@
+---
+title: 'Neural network layers'
+description: 'High-level nn:: building blocks for fully connected, embedding, feed-forward, convolutional, and transformer layers.'
+keywords: ['linear', 'embedding', 'mlp', 'conv2d', 'transformer', 'swiglu', 'neural network']
+---
+
+Each struct holds parameter [`NodeId`](/api/graph-ops)s and provides a `forward()` method that appends operations to the [`Graph`](/api/graph-ops). These are thin wrappers over the low-level graph API — no trait hierarchy, no dynamic dispatch.
+
+```rust
+let mut g = Graph::new();
+let x = g.input("x", &[batch, 784]);
+let labels = g.input("labels", &[batch, 10]);
+
+let fc1 = nn::Linear::new(&mut g, "fc1", 784, 128);
+let fc2 = nn::Linear::new(&mut g, "fc2", 128, 10);
+
+let h = fc1.forward(&mut g, x);
+let h = g.relu(h);
+let logits = fc2.forward(&mut g, h);
+let loss = g.cross_entropy_loss(logits, labels);
+```
+
+---
+
+## `nn::Linear`
+
+Fully connected linear layer: `y = x @ weight + bias`.
+
+**Fields**
+
+<ParamField path="weight" type="NodeId" required>
+  Weight parameter of shape `[in_features, out_features]`.
+</ParamField>
+
+<ParamField path="bias" type="Option<NodeId>">
+  Optional bias parameter of shape `[out_features]`. `None` when constructed with `no_bias`.
+</ParamField>
+
+### `Linear::new`
+
+Creates a linear layer with a bias term.
+
+<ParamField path="g" type="&mut Graph" required>
+  The computation graph to register parameters into.
+</ParamField>
+
+<ParamField path="name" type="&str" required>
+  Name prefix for the parameters. Registers `{name}.weight` and `{name}.bias`.
+</ParamField>
+
+<ParamField path="in_features" type="usize" required>
+  Number of input features.
+</ParamField>
+
+<ParamField path="out_features" type="usize" required>
+  Number of output features.
+</ParamField>
+
+```rust
+let fc = nn::Linear::new(&mut g, "fc", 784, 128);
+```
+
+### `Linear::no_bias`
+
+Creates a linear layer without a bias term.
+
+<ParamField path="g" type="&mut Graph" required>
+  The computation graph to register parameters into.
+</ParamField>
+
+<ParamField path="name" type="&str" required>
+  Name prefix. Registers only `{name}.weight`.
+</ParamField>
+
+<ParamField path="in_features" type="usize" required>
+  Number of input features.
+</ParamField>
+
+<ParamField path="out_features" type="usize" required>
+  Number of output features.
+</ParamField>
+
+```rust
+let proj = nn::Linear::no_bias(&mut g, "q_proj", 512, 512);
+```
+
+### `forward`
+
+Appends a matrix multiply and optional bias add to the graph.
+
+<ParamField path="g" type="&mut Graph" required>
+  The computation graph to append ops to.
+</ParamField>
+
+<ParamField path="x" type="NodeId" required>
+  Input tensor of shape `[batch, in_features]`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Output tensor of shape `[batch, out_features]`.
+</ResponseField>
+
+```rust
+let mut g = Graph::new();
+let x = g.input("x", &[4, 8]);
+let fc = nn::Linear::new(&mut g, "fc", 8, 3);
+let y = fc.forward(&mut g, x);
+// y shape: [4, 3]
+```
+
+---
+
+## `nn::Embedding`
+
+Token embedding lookup table. Maps integer token indices to dense vectors.
+
+**Fields**
+
+<ParamField path="weight" type="NodeId" required>
+  Embedding table parameter of shape `[vocab_size, embed_dim]`.
+</ParamField>
+
+### `Embedding::new`
+
+<ParamField path="g" type="&mut Graph" required>
+  The computation graph to register parameters into.
+</ParamField>
+
+<ParamField path="name" type="&str" required>
+  Name for the embedding weight parameter.
+</ParamField>
+
+<ParamField path="vocab_size" type="usize" required>
+  Number of tokens in the vocabulary.
+</ParamField>
+
+<ParamField path="embed_dim" type="usize" required>
+  Dimensionality of each token embedding.
+</ParamField>
+
+```rust
+let embed = nn::Embedding::new(&mut g, "token_embeddings", 32000, 512);
+```
+
+### `forward`
+
+<ParamField path="g" type="&mut Graph" required>
+  The computation graph to append ops to.
+</ParamField>
+
+<ParamField path="indices" type="NodeId" required>
+  1D U32 tensor of shape `[seq_len]` containing token indices.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Output tensor of shape `[seq_len, embed_dim]`.
+</ResponseField>
+
+```rust
+let indices = g.input_u32("tokens", &[seq_len]);
+let embed = nn::Embedding::new(&mut g, "tok_emb", 32000, 512);
+let h = embed.forward(&mut g, indices);
+// h shape: [seq_len, 512]
+```
+
+---
+
+## `nn::SwiGluFfn`
+
+SwiGLU feed-forward network: `silu(gate(x)) * up(x)` then down-projected back to the hidden dimension.
+
+Internally uses three bias-free linear projections registered as `{name}.gate_proj`, `{name}.up_proj`, and `{name}.down_proj`.
+
+**Fields**
+
+<ParamField path="gate" type="Linear" required>
+  Gate projection: `hidden → intermediate`.
+</ParamField>
+
+<ParamField path="up" type="Linear" required>
+  Up projection: `hidden → intermediate`.
+</ParamField>
+
+<ParamField path="down" type="Linear" required>
+  Down projection: `intermediate → hidden`.
+</ParamField>
+
+### `SwiGluFfn::new`
+
+<ParamField path="g" type="&mut Graph" required>
+  The computation graph to register parameters into.
+</ParamField>
+
+<ParamField path="name" type="&str" required>
+  Name prefix. Registers `{name}.gate_proj`, `{name}.up_proj`, `{name}.down_proj`.
+</ParamField>
+
+<ParamField path="hidden" type="usize" required>
+  Hidden (input and output) dimension.
+</ParamField>
+
+<ParamField path="intermediate" type="usize" required>
+  Intermediate (expanded) dimension.
+</ParamField>
+
+```rust
+let ffn = nn::SwiGluFfn::new(&mut g, "model.layers.0.mlp", 512, 1365);
+```
+
+### `forward`
+
+<ParamField path="g" type="&mut Graph" required>
+  The computation graph to append ops to.
+</ParamField>
+
+<ParamField path="x" type="NodeId" required>
+  Input tensor of shape `[seq, hidden]`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Output tensor of shape `[seq, hidden]`.
+</ResponseField>
+
+```rust
+let ffn = nn::SwiGluFfn::new(&mut g, "ffn", 512, 1365);
+let out = ffn.forward(&mut g, x);
+// out shape: [seq, 512]
+```
+
+---
+
+## `nn::Mlp`
+
+Standard two-layer MLP: `fc2(activation(fc1(x)))`.
+
+**Fields**
+
+<ParamField path="fc1" type="Linear" required>
+  First linear layer: `in_dim → hidden_dim` (with bias).
+</ParamField>
+
+<ParamField path="fc2" type="Linear" required>
+  Second linear layer: `hidden_dim → out_dim` (with bias).
+</ParamField>
+
+<ParamField path="activation" type="Activation" required>
+  Activation function applied between the two layers.
+</ParamField>
+
+### `Activation`
+
+```rust
+pub enum Activation {
+    Relu,
+    Gelu,
+    Silu,
+    Sigmoid,
+}
+```
+
+### `Mlp::new`
+
+<ParamField path="g" type="&mut Graph" required>
+  The computation graph to register parameters into.
+</ParamField>
+
+<ParamField path="name" type="&str" required>
+  Name prefix. Registers `{name}.fc1.weight`, `{name}.fc1.bias`, `{name}.fc2.weight`, `{name}.fc2.bias`.
+</ParamField>
+
+<ParamField path="in_dim" type="usize" required>
+  Input feature dimension.
+</ParamField>
+
+<ParamField path="hidden_dim" type="usize" required>
+  Hidden layer dimension.
+</ParamField>
+
+<ParamField path="out_dim" type="usize" required>
+  Output feature dimension.
+</ParamField>
+
+<ParamField path="activation" type="Activation" required>
+  Activation function to use between layers.
+</ParamField>
+
+```rust
+let mlp = nn::Mlp::new(&mut g, "mlp", 8, 16, 3, nn::Activation::Relu);
+```
+
+### `forward`
+
+<ParamField path="g" type="&mut Graph" required>
+  The computation graph to append ops to.
+</ParamField>
+
+<ParamField path="x" type="NodeId" required>
+  Input tensor of shape `[batch, in_dim]`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Output tensor of shape `[batch, out_dim]`.
+</ResponseField>
+
+```rust
+let mut g = Graph::new();
+let x = g.input("x", &[4, 8]);
+let mlp = nn::Mlp::new(&mut g, "mlp", 8, 16, 3, nn::Activation::Relu);
+let y = mlp.forward(&mut g, x);
+// y shape: [4, 3]
+```
+
+---
+
+## `nn::Conv2d`
+
+2D convolution layer: `y = conv2d(x, weight) + bias`. Input and output tensors are flat 1D arrays in NCHW layout.
+
+**Fields**
+
+<ParamField path="weight" type="NodeId" required>
+  Kernel parameter of shape `[out_channels * in_channels * kernel_h * kernel_w]` (flat 1D).
+</ParamField>
+
+<ParamField path="bias" type="Option<NodeId>">
+  Optional bias. Currently `None` after construction — set manually if needed.
+</ParamField>
+
+<ParamField path="in_channels" type="u32" required>
+  Number of input channels.
+</ParamField>
+
+<ParamField path="in_h" type="u32" required>
+  Input spatial height.
+</ParamField>
+
+<ParamField path="in_w" type="u32" required>
+  Input spatial width.
+</ParamField>
+
+<ParamField path="out_channels" type="u32" required>
+  Number of output channels.
+</ParamField>
+
+<ParamField path="kernel_h" type="u32" required>
+  Kernel height (equal to `kernel_size` passed to `new`).
+</ParamField>
+
+<ParamField path="kernel_w" type="u32" required>
+  Kernel width (equal to `kernel_size` passed to `new`).
+</ParamField>
+
+<ParamField path="stride" type="u32" required>
+  Convolution stride.
+</ParamField>
+
+<ParamField path="padding" type="u32" required>
+  Zero-padding added to each spatial edge.
+</ParamField>
+
+### `Conv2d::new`
+
+<ParamField path="g" type="&mut Graph" required>
+  The computation graph to register parameters into.
+</ParamField>
+
+<ParamField path="name" type="&str" required>
+  Name prefix. Registers `{name}.weight` as a flat 1D parameter.
+</ParamField>
+
+<ParamField path="in_channels" type="u32" required>
+  Number of input channels.
+</ParamField>
+
+<ParamField path="out_channels" type="u32" required>
+  Number of output channels.
+</ParamField>
+
+<ParamField path="kernel_size" type="u32" required>
+  Square kernel side length (sets both `kernel_h` and `kernel_w`).
+</ParamField>
+
+<ParamField path="in_h" type="u32" required>
+  Input spatial height.
+</ParamField>
+
+<ParamField path="in_w" type="u32" required>
+  Input spatial width.
+</ParamField>
+
+<ParamField path="stride" type="u32" required>
+  Convolution stride.
+</ParamField>
+
+<ParamField path="padding" type="u32" required>
+  Zero-padding on each edge.
+</ParamField>
+
+```rust
+let conv = nn::Conv2d::new(&mut g, "conv1", 3, 64, 3, 224, 224, 1, 1);
+```
+
+### `forward`
+
+<ParamField path="g" type="&mut Graph" required>
+  The computation graph to append ops to.
+</ParamField>
+
+<ParamField path="x" type="NodeId" required>
+  Flat input tensor of shape `[N * in_channels * in_h * in_w]` in NCHW order.
+</ParamField>
+
+<ParamField path="batch" type="u32" required>
+  Batch size `N`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Flat output tensor of shape `[N * out_channels * out_h * out_w]` in NCHW order, where `out_h = (in_h + 2*padding - kernel_h) / stride + 1`.
+</ResponseField>
+
+```rust
+let conv = nn::Conv2d::new(&mut g, "conv1", 3, 64, 3, 224, 224, 1, 1);
+let y = conv.forward(&mut g, x, batch);
+// y shape: [N * 64 * 224 * 224] (with padding=1, stride=1, kernel=3)
+```
+
+<Note>
+  All tensors for `Conv2d` are stored as flat 1D arrays. Spatial metadata (channels, height, width, kernel dimensions, stride, padding) is encoded in the op and used by the GPU kernel. There is no explicit reshape needed.
+</Note>
+
+---
+
+## `nn::TransformerBlock`
+
+A single transformer decoder block combining pre-norm attention, a residual connection, and a SwiGLU feed-forward network with a second residual connection.
+
+Forward pass:
+```
+x = x + attn(attn_norm(x))
+x = x + ffn(ffn_norm(x))
+```
+
+**Fields**
+
+<ParamField path="attn_norm" type="RmsNorm" required>
+  RMS normalization applied before attention. Parameter name: `{name}.input_layernorm.weight`.
+</ParamField>
+
+<ParamField path="attn" type="CausalSelfAttention" required>
+  Causal self-attention module. Parameter names prefixed with `{name}.self_attn`.
+</ParamField>
+
+<ParamField path="ffn_norm" type="RmsNorm" required>
+  RMS normalization applied before the feed-forward network. Parameter name: `{name}.post_attention_layernorm.weight`.
+</ParamField>
+
+<ParamField path="ffn" type="SwiGluFfn" required>
+  SwiGLU feed-forward network. Parameter names prefixed with `{name}.mlp`.
+</ParamField>
+
+### `TransformerBlockConfig`
+
+```rust
+pub struct TransformerBlockConfig {
+    pub hidden: usize,
+    pub intermediate: usize,
+    pub kv_dim: usize,
+    pub num_heads: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub rms_eps: f32,
+    pub rope_theta: f32,
+}
+```
+
+<ParamField path="hidden" type="usize" required>
+  Hidden dimension (model width).
+</ParamField>
+
+<ParamField path="intermediate" type="usize" required>
+  Intermediate dimension for the SwiGLU FFN.
+</ParamField>
+
+<ParamField path="kv_dim" type="usize" required>
+  Key/value projection dimension (`num_kv_heads * head_dim`).
+</ParamField>
+
+<ParamField path="num_heads" type="u32" required>
+  Number of query attention heads.
+</ParamField>
+
+<ParamField path="num_kv_heads" type="u32" required>
+  Number of key/value heads (for grouped-query attention).
+</ParamField>
+
+<ParamField path="head_dim" type="u32" required>
+  Dimension per attention head.
+</ParamField>
+
+<ParamField path="rms_eps" type="f32" required>
+  Epsilon for RMS normalization numerical stability.
+</ParamField>
+
+<ParamField path="rope_theta" type="f32" required>
+  Base frequency for rotary position embeddings.
+</ParamField>
+
+### `TransformerBlock::new`
+
+<ParamField path="g" type="&mut Graph" required>
+  The computation graph to register parameters into.
+</ParamField>
+
+<ParamField path="name" type="&str" required>
+  Name prefix, typically `"model.layers.{i}"`.
+</ParamField>
+
+<ParamField path="cfg" type="&TransformerBlockConfig" required>
+  Block configuration.
+</ParamField>
+
+### `forward`
+
+<ParamField path="g" type="&mut Graph" required>
+  The computation graph to append ops to.
+</ParamField>
+
+<ParamField path="x" type="NodeId" required>
+  Input tensor of shape `[seq, hidden]`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Output tensor of shape `[seq, hidden]`.
+</ResponseField>
+
+```rust
+let mut g = Graph::new();
+let x = g.input("x", &[16, 64]);
+let cfg = nn::TransformerBlockConfig {
+    hidden: 64,
+    intermediate: 128,
+    kv_dim: 32,
+    num_heads: 4,
+    num_kv_heads: 2,
+    head_dim: 16,
+    rms_eps: 1e-5,
+    rope_theta: 10000.0,
+};
+let block = nn::TransformerBlock::new(&mut g, "model.layers.0", &cfg);
+let y = block.forward(&mut g, x);
+// y shape: [16, 64]
+```

@@ -1,0 +1,171 @@
+---
+title: "E-graph optimization"
+description: "How Meganeura uses equality saturation with egglog to discover and apply kernel fusions before GPU compilation."
+keywords: ["egglog", "e-graph", "equality saturation", "fusion", "optimize", "OptimizeReport"]
+---
+
+Before compiling a graph to GPU dispatches, Meganeura runs an optimization pass that fuses operations. The optimizer uses **equality saturation** — a technique that explores many equivalent rewrites simultaneously rather than applying them greedily one at a time.
+
+## What equality saturation is
+
+A conventional compiler applies rewrite rules in a fixed order: if rule A fires and prevents rule B from firing later, you get a locally optimal but globally suboptimal result. Equality saturation avoids this by maintaining an *e-graph* (equality graph) — a compact data structure that represents many equivalent program variants at once. Rules are applied until no new equivalences can be discovered (saturation), then the cheapest variant is extracted.
+
+The result is that the optimizer can simultaneously discover `MatMul+Add → FusedMatMulAdd` and `SwiGLU(MatMul, MatMul) → SwiGLUConcat(MatMul)` without either rule blocking the other.
+
+## Why egglog
+
+Meganeura uses [egglog](https://github.com/egraphs-good/egglog) as its e-graph engine. Egglog combines the equality saturation algorithm with a Datalog-style rule language, making it concise to express algebraic rewrite rules directly over the graph IR.
+
+Each graph node is encoded as an egglog term. Rewrite rules express the algebraic equivalences the optimizer is allowed to exploit:
+
+```
+; Kernel fusion: Add(MatMul*(a,b), d) → FusedMatMul*Add(a,b,d)
+(rewrite (Add (MatMul ?a ?b) ?d)    (FusedMatMulAdd ?a ?b ?d))
+(rewrite (Add ?d (MatMul ?a ?b))    (FusedMatMulAdd ?a ?b ?d))
+(rewrite (Add (MatMulAT ?a ?b) ?d)  (FusedMatMulATAdd ?a ?b ?d))
+(rewrite (Add ?d (MatMulAT ?a ?b))  (FusedMatMulATAdd ?a ?b ?d))
+(rewrite (Add (MatMulBT ?a ?b) ?d)  (FusedMatMulBTAdd ?a ?b ?d))
+(rewrite (Add ?d (MatMulBT ?a ?b))  (FusedMatMulBTAdd ?a ?b ?d))
+
+; Algebraic simplifications
+(rewrite (Neg (Neg ?x)) ?x)
+(rewrite (Transpose (Transpose ?x)) ?x)
+(rewrite (Relu (Relu ?x)) (Relu ?x))
+
+; RmsNorm+MatMul fusion
+(rewrite (MatMul (RmsNorm ?x ?w_norm) ?w_proj) (FusedRmsNormMatMul ?x ?w_norm ?w_proj))
+```
+
+Both argument orders of `Add` are listed explicitly rather than using a general commutativity rule, because a fully commutative `Add` causes exponential e-class growth on large transformer graphs.
+
+<Note>
+  For graphs with more than 300 nodes, egglog saturation is skipped and Meganeura falls back to direct pattern matching. Shared-weight graphs such as transformer stacks create large e-classes that make saturation slow at that scale. The same fusion rules are applied via an iterative fixpoint loop instead.
+</Note>
+
+## Fusions applied
+
+<AccordionGroup>
+  <Accordion title="MatMul+Add → FusedMatMulAdd">
+    When a `MatMul`, `MatMulAT`, or `MatMulBT` node is consumed only by an `Add` node, both are replaced by a single fused node (`FusedMatMulAdd`, `FusedMatMulATAdd`, or `FusedMatMulBTAdd`). This eliminates the intermediate buffer write and saves one round-trip to GPU memory.
+
+    The fusion applies to both forward and backward passes. For example, the backward input gradient `grad_out @ W^T + prev_grad` becomes a single `FusedMatMulBTAdd` dispatch.
+  </Accordion>
+  <Accordion title="SwiGLU(MatMul, MatMul) → SwiGLUConcat(MatMul)">
+    When a `SwiGLU` node consumes two `MatMul` nodes that share the same input tensor (`h`), the optimizer fuses them into one wide matmul followed by `SwiGLUConcat`:
+
+    ```
+    SwiGLU(MatMul(h, w_gate), MatMul(h, w_up))
+      → SwiGLUConcat(MatMul(h, concat(w_gate, w_up)))
+    ```
+
+    This halves the number of matmul dispatches for the MLP gate+up projection. The optimizer creates a derived `concat` parameter node and records the split point in `DerivedParam` so the runtime can fill it correctly when you call `session.set_parameter()`.
+  </Accordion>
+  <Accordion title="FusedRmsNormMatMul (disabled by default)">
+    `MatMul(RmsNorm(x, w_norm), w_proj) → FusedRmsNormMatMul(x, w_norm, w_proj)` saves one intermediate write. This fusion is currently disabled for integrated GPUs because the per-element normalization overhead inside the tiled kernel outweighs the bandwidth savings. It can be enabled manually via `apply_rms_norm_matmul_fusions`.
+  </Accordion>
+  <Accordion title="GroupNorm+Silu → GroupNormSilu (inference only)">
+    Applied by `apply_group_norm_silu_fusions` during `build_inference_session`. Not applied to training graphs because the fused backward pass is not implemented.
+  </Accordion>
+</AccordionGroup>
+
+## OptimizeReport
+
+`build_session_with_report()` returns an `OptimizeReport` alongside the session. Use it to inspect what the optimizer did:
+
+```rust
+pub struct OptimizeReport {
+    /// The egglog program text (for external inspection / replay).
+    pub egglog_program: String,
+    /// Number of e-classes after saturation.
+    pub num_eclasses: usize,
+    /// Number of e-nodes after saturation.
+    pub num_enodes: usize,
+    /// Which rewrite rules fired and how many times.
+    pub rules_fired: Vec<(String, usize)>,
+    /// Graph node count before optimization.
+    pub nodes_before: usize,
+    /// Graph node count after optimization (excluding Nop).
+    pub nodes_after: usize,
+    /// Fusions applied: list of (fusion_name, node_index) pairs.
+    pub fusions_applied: Vec<(String, u32)>,
+    /// Wall-clock time for egglog saturation.
+    pub egglog_time: std::time::Duration,
+    /// Wall-clock time for graph extraction + fusion rewrites.
+    pub extract_time: std::time::Duration,
+}
+```
+
+Printing the report gives a human-readable summary:
+
+```
+=== Optimization Report ===
+Egglog saturation: 2.3ms (41 e-classes, 87 e-nodes)
+Rules fired:
+  MatMul+Add→FusedMatMulAdd  x6
+  SwiGLU(MatMul,MatMul)→SwiGLUConcat(MatMul)  x2
+Graph: 94 nodes -> 82 active nodes (12 fused away)
+Fusions: MatMul+Add→FusedMatMulAdd @node12, ...
+Extract time: 0.4ms
+```
+
+## Getting the report
+
+<Steps>
+  <Step title="Build the graph">
+    Construct your forward graph as usual, ending in a scalar loss:
+
+    ```rust
+    let mut g = Graph::new();
+    let x  = g.input("x",      &[batch, 784]);
+    let w1 = g.parameter("w1", &[784, 128]);
+    // ... rest of model ...
+    g.set_outputs(vec![loss]);
+    ```
+  </Step>
+  <Step title="Call build_session_with_report">
+    ```rust
+    use meganeura::build_session_with_report;
+
+    let (session, report) = build_session_with_report(&g);
+    println!("{}", report);
+    ```
+  </Step>
+  <Step title="Inspect fusions">
+    Check `report.fusions_applied` to verify the expected fusions fired. If you added a `SwiGLU` path but the fusion did not fire, check that both `MatMul` operands share the same input node and that neither matmul is consumed by more than one downstream op.
+  </Step>
+</Steps>
+
+## When the optimizer runs
+
+The optimizer runs twice during `build_session()`:
+
+1. **Before autodiff** — on the forward graph only. This runs before `differentiate()` so that the backward pass differentiates the fused ops (e.g. `SwiGLUConcat`) rather than the unfused originals.
+2. **After autodiff** — on the full graph (forward + backward). This catches new fusion opportunities in the backward pass, such as fusing backward `MatMulBT+Add` nodes.
+
+The pipeline in `build_session_with_report` is:
+
+```rust
+// Step 1: optimize forward
+let optimized_forward = optimize::optimize(forward_graph);
+
+// Step 2: toposort + autodiff
+let sorted_forward = optimized_forward.toposort();
+let full_graph = autodiff::differentiate(&sorted_forward);
+
+// Step 3: optimize full graph (forward + backward)
+let (optimized, report) = optimize::optimize_with_report(&full_graph);
+
+// Step 4: compile
+let plan = compile::compile(&optimized);
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Automatic differentiation" icon="arrows-split-up-and-left" href="/concepts/autodiff">
+    How the backward pass is constructed from the optimized forward graph.
+  </Card>
+  <Card title="GPU execution" icon="microchip" href="/concepts/gpu-execution">
+    How the compiled plan is executed on Vulkan and Metal hardware.
+  </Card>
+</CardGroup>

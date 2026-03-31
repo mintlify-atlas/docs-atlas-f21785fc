@@ -1,0 +1,176 @@
+---
+title: "Benchmarking"
+description: "Run Meganeura's benchmark suite and interpret results against PyTorch."
+keywords: ["benchmarking", "infermark", "SmolVLA", "SmolLM2", "compare.sh", "performance"]
+---
+
+Meganeura ships a benchmark suite under `bench/` that measures latency for training and inference workloads and compares results against PyTorch. Results are also published on [Infermark](https://kvark.github.io/infermark/), a comprehensive comparison between frameworks.
+
+## Running the benchmarks
+
+<Steps>
+  <Step title="Set up the Python virtual environment (one-time)">
+    The benchmark suite runs both the Meganeura Rust binary and the equivalent PyTorch Python script, then prints a side-by-side comparison table.
+
+    ```bash
+    bash bench/ensure_venv.sh
+    ```
+  </Step>
+  <Step title="Run the default benchmark (SmolVLA training)">
+    ```bash
+    bash bench/compare.sh
+    ```
+
+    This builds and runs `bench_smolvla_train` against the PyTorch equivalent and prints a comparison table.
+  </Step>
+  <Step title="Run a specific model benchmark">
+    ```bash
+    # SmolVLA action expert inference
+    bash bench/compare.sh --model smolvla
+
+    # SmolLM2-135M text generation
+    bash bench/compare.sh --model smollm2
+
+    # Stable Diffusion U-Net training
+    bash bench/compare.sh --model sd_unet_train
+
+    # All benchmarks
+    bash bench/compare.sh --model all
+    ```
+  </Step>
+</Steps>
+
+### Environment overrides
+
+You can tune the benchmark parameters with environment variables:
+
+```bash
+RUNS=10 WARMUP=5 bash bench/compare.sh --model smolvla
+```
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RUNS` | `5` | Number of timed runs |
+| `WARMUP` | `3` | Warm-up runs before timing |
+| `PYTORCH_DTYPE` | `float32` | PyTorch dtype for comparison |
+| `STEPS` | `10` | Denoising steps (SmolVLA only) |
+| `CHUNK_SIZE` | `50` | Action chunk size (SmolVLA only) |
+| `VLM_SEQ_LEN` | `16` | VLM context length (SmolVLA only) |
+| `MAX_TOKENS` | `32` | Tokens to generate (SmolLM2 only) |
+
+Pass `--no-venv` to use the system Python instead of the managed venv:
+
+```bash
+bash bench/compare.sh --no-venv
+```
+
+## SmolVLA training results
+
+The table below shows SmolVLA action expert training results (chunk_size=50, vlm_seq_len=16, float32, random weights) with full GQA (15/5 heads, head_dim=64) and exact backward through all ops including fused MHA and RmsNorm:
+
+| GPU | Framework | Compile | Forward | Backward |
+|-----|-----------|---------|---------|----------|
+| Radeon 890M (RADV) | Meganeura | 0 s | 14.2 ms | 36.4 ms |
+| Radeon 890M (RADV) | PyTorch 2.10.0 ROCm | 7.30 s | 20.9 ms | 48.0 ms |
+| GeForce RTX 5080 (590/Linux) | Meganeura | 0 s | 6.1 ms | 35.1 ms |
+| GeForce RTX 5080 (590/Linux) | PyTorch 2.11.0+cu128 | 3.41 s | 1.57 ms | 4.68 ms |
+| GeForce RTX 3050 (566.36/Windows) | Meganeura | 0 s | 11.2 ms | 53.3 ms |
+| GeForce RTX 3050 (566.36/Windows) | PyTorch 2.11.0+cu128 | 0 s (unsupported) | 12.3 ms | 33.8 ms |
+| Apple M3 | Meganeura | 0 s | 45.5 ms | 87.0 ms |
+| Apple M3 | PyTorch 2.11.0 | 5.92 s | 17.7 ms | 78.1 ms |
+
+<Note>
+  Meganeura reports 0 s compile time because the execution plan is cached after the first build — subsequent runs skip autodiff, egglog, and compilation entirely. See [Execution plan caching](/advanced/caching) for details.
+</Note>
+
+## Gradient verification
+
+Gradients are verified against PyTorch running on CPU. **88 out of 136 parameters pass the strict threshold** (cosine similarity > 0.99, norm error < 5%). Failures are in attention and layernorm weights of deeper layers, where f32 precision differences compound across the network. Gradient magnitudes (norm error) remain below 2% for all parameters.
+
+You can reproduce gradient verification with:
+
+```bash
+cargo run --release --example grad_check
+```
+
+## Benchmark examples
+
+### `bench_meganeura` — SmolLM2-135M inference
+
+`bench/bench_meganeura.rs` measures per-step latency and tokens per second for SmolLM2-135M text generation. It outputs a JSON file with timing statistics for comparison:
+
+```rust
+use meganeura::{
+    Graph, build_inference_session,
+    data::safetensors::SafeTensorsModel,
+    models::smollm2::{self, SmolLM2Config},
+};
+
+let config = SmolLM2Config::smollm2_135m();
+let mut g = Graph::new();
+let logits = smollm2::build_graph(&mut g, &config, seq_len);
+g.set_outputs(vec![logits]);
+
+let mut session = build_inference_session(&g);
+```
+
+Run it directly with:
+
+```bash
+cargo run --release --example bench_meganeura -- \
+    --prompt "The meaning of life is" \
+    --max-tokens 32 \
+    --warmup 3 \
+    --runs 5
+```
+
+### `bench_smolvla_meganeura` — SmolVLA action expert
+
+`bench/bench_smolvla_meganeura.rs` measures the SmolVLA denoising loop latency using synthetic inputs. On Linux it checks preconditions (AC power, GPU load, clock speed) before running to improve result reliability:
+
+```rust
+use meganeura::{
+    Graph, build_inference_session,
+    data::safetensors::SafeTensorsModel,
+    models::smolvla::{self, SmolVLAConfig},
+};
+
+let config = SmolVLAConfig::smolvla_base();
+let mut g = Graph::new();
+let action_out = smolvla::build_action_expert(&mut g, &config, action_seq_len, vlm_seq_len);
+g.set_outputs(vec![action_out]);
+
+let mut session = build_inference_session(&g);
+```
+
+Run it directly with:
+
+```bash
+cargo run --release --example bench_smolvla_meganeura -- \
+    --steps 10 \
+    --warmup 3 \
+    --runs 5 \
+    --force
+```
+
+Pass `--force` to skip the precondition check (useful in CI or when GPU is partially loaded).
+
+## Profiling benchmark runs
+
+Attach `MEGANEURA_TRACE` to any benchmark run to capture a Perfetto trace alongside timing numbers:
+
+```bash
+MEGANEURA_TRACE=bench.pftrace \
+  cargo run --release --example bench_smolvla_meganeura -- \
+    --steps 1 --warmup 0 --runs 1 --force
+```
+
+Open `bench.pftrace` at [https://ui.perfetto.dev/](https://ui.perfetto.dev/) to see CPU spans and GPU kernel durations on the same timeline. See [Profiling](/advanced/profiling) for a full walkthrough.
+
+<Tip>
+  Use a single warm-up run when profiling so the trace reflects steady-state GPU behaviour rather than cold-start compilation artefacts.
+</Tip>
+
+## Infermark
+
+Aggregated benchmark results across frameworks and hardware are published on [Infermark](https://kvark.github.io/infermark/). Infermark provides a reproducible comparison methodology — results are gathered from the same `bench/compare.sh` script using standardized hardware configurations.

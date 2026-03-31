@@ -1,0 +1,125 @@
+---
+title: "Profiling"
+description: "Capture Perfetto traces of CPU and GPU activity in Meganeura using the built-in profiler."
+keywords: ["profiling", "perfetto", "trace", "MEGANEURA_TRACE", "pftrace"]
+---
+
+Meganeura includes a built-in profiler that records CPU span timings and GPU pass durations into a single Perfetto binary trace (`.pftrace`). You can open the resulting file in [Perfetto UI](https://ui.perfetto.dev/) to inspect exactly where time is spent during session build, training, and inference.
+
+<Warning>
+  Profiling adds measurement overhead. CPU spans use mutex-protected event buffers on every span enter and exit. Do not use profiling runs to measure peak performance — use them for structural analysis only.
+</Warning>
+
+## Enabling profiling with `MEGANEURA_TRACE`
+
+The simplest way to enable profiling is to set the `MEGANEURA_TRACE` environment variable to the output file path before running your binary. All examples in the repository check this variable and initialize the profiler automatically.
+
+```bash
+MEGANEURA_TRACE=trace.pftrace cargo run --release --example mnist
+```
+
+The trace file is written when the process finishes (or when you call `profiler::save` explicitly).
+
+## The profiler API
+
+You can also enable profiling programmatically:
+
+```rust
+// Install the global tracing subscriber — safe to call multiple times.
+// Must be called before any spans you want captured.
+meganeura::profiler::init();
+
+// ... build session, train, run inference ...
+
+// Write all collected events to a .pftrace file.
+meganeura::profiler::save("trace.pftrace").unwrap();
+```
+
+`profiler::init()` installs a global [`tracing`](https://docs.rs/tracing) subscriber that records span enter/exit events on the CPU track. Subsequent calls are no-ops, so it is safe to call from multiple locations.
+
+`profiler::save(path)` serializes all collected events — both CPU spans and GPU pass timings — into a Perfetto binary protobuf file at the given path.
+
+### Example: trace path logic from `examples/mnist.rs`
+
+The MNIST example shows the idiomatic pattern for optional profiling:
+
+```rust
+// Set up Perfetto profiling: MEGANEURA_TRACE=path.pftrace
+let trace_path = std::env::var("MEGANEURA_TRACE").ok();
+if trace_path.is_some() {
+    meganeura::profiler::init();
+}
+
+// ... build session, train ...
+
+// Save Perfetto trace when profiling.
+if let Some(ref trace_file) = trace_path {
+    let path = Path::new(trace_file);
+    meganeura::profiler::save(path).expect("failed to save profile");
+    println!("profile saved to {}", path.display());
+}
+```
+
+## Perfetto trace format
+
+Meganeura writes traces in the [Perfetto](https://perfetto.dev/) binary protobuf format (`.pftrace`). Perfetto is an open-source system tracing platform used by Android and Chrome.
+
+<Steps>
+  <Step title="Run your binary with tracing enabled">
+    ```bash
+    MEGANEURA_TRACE=my_trace.pftrace cargo run --release --example mnist
+    ```
+  </Step>
+  <Step title="Open Perfetto UI">
+    Navigate to [https://ui.perfetto.dev/](https://ui.perfetto.dev/) in your browser.
+  </Step>
+  <Step title="Load the trace file">
+    Click **Open trace file** and select the `.pftrace` file produced in the previous step.
+  </Step>
+  <Step title="Inspect the timeline">
+    The trace contains two tracks under the `meganeura` process: **CPU** and **GPU**. Use the WASD keys or scroll wheel to navigate the timeline.
+  </Step>
+</Steps>
+
+<Note>
+  Perfetto UI runs entirely in the browser — your trace data is never uploaded to a server.
+</Note>
+
+## What appears in the trace
+
+The trace is organized into two tracks:
+
+| Track | Contents |
+|-------|----------|
+| **CPU** | All `tracing` spans from session build, training epochs, and input staging |
+| **GPU** | Per-pass hardware timestamp durations from blade-graphics |
+
+### CPU spans
+
+The following named spans appear on the CPU track:
+
+| Span | When it appears |
+|------|----------------|
+| `build_session` | Wraps the entire session build pipeline |
+| `optimize_forward` | egglog optimization of the forward graph |
+| `autodiff` | Automatic differentiation pass |
+| `optimize_full` | egglog optimization of the combined forward + backward graph |
+| `compile` | Compilation of the optimized graph to an `ExecutionPlan` |
+| `gpu_init` | GPU resource allocation (`Session::new`) |
+| `train_epoch` | One full pass over the dataset |
+| `set_input` | Staging input data into GPU buffers before each step |
+
+### GPU passes
+
+GPU pass durations are recorded from blade-graphics hardware timestamp queries and placed on the GPU track. Individual kernel names (e.g. `matmul`, `relu`) appear as GPU slices, laid out sequentially from the submission timestamp of each command buffer.
+
+## Profiling benchmark runs
+
+You can attach `MEGANEURA_TRACE` to any benchmark binary in the same way:
+
+```bash
+MEGANEURA_TRACE=bench_trace.pftrace \
+  cargo run --release --example bench_smolvla_meganeura -- --runs 1 --warmup 0
+```
+
+This lets you inspect the dispatch sequence for a single SmolVLA denoising step alongside GPU kernel durations on the same timeline.

@@ -1,0 +1,810 @@
+---
+title: "Graph"
+description: "The computation graph — the core data structure for defining neural network models in Meganeura."
+---
+
+The `Graph` struct is the central abstraction in Meganeura. You define a model by adding nodes to a graph, then compile the graph into a GPU session for training or inference.
+
+```rust
+use meganeura::Graph;
+
+let mut g = Graph::new();
+let x = g.input("x", &[4, 784]);
+let w = g.parameter("w", &[784, 128]);
+let y = g.matmul(x, w);
+let h = g.relu(y);
+g.set_outputs(vec![h]);
+```
+
+---
+
+## Types
+
+### `NodeId`
+
+```rust
+pub type NodeId = u32;
+```
+
+A handle to a node in the graph. All graph builder methods return a `NodeId` and accept `NodeId` values as inputs.
+
+---
+
+### `DType`
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DType {
+    F32,
+    U32,
+}
+```
+
+The element type of a tensor.
+
+<ResponseField name="F32" type="variant">
+  32-bit floating point. Used for activations, weights, and gradients.
+</ResponseField>
+
+<ResponseField name="U32" type="variant">
+  32-bit unsigned integer. Used for token indices, position offsets, and KV cache positions.
+</ResponseField>
+
+#### Methods
+
+<ResponseField name="size_bytes" type="fn(self) -> usize">
+  Returns the byte width of one element. Both `F32` and `U32` return `4`.
+</ResponseField>
+
+---
+
+### `TensorType`
+
+```rust
+pub struct TensorType {
+    pub shape: Vec<usize>,
+    pub dtype: DType,
+}
+```
+
+Describes the shape and element type of a tensor node.
+
+<ResponseField name="shape" type="Vec<usize>">
+  Dimension sizes, from outermost to innermost (e.g. `[batch, features]`).
+</ResponseField>
+
+<ResponseField name="dtype" type="DType">
+  Element type of the tensor.
+</ResponseField>
+
+#### Methods
+
+<ResponseField name="new" type="fn(shape: Vec<usize>, dtype: DType) -> TensorType">
+  Constructs a `TensorType` with the given shape and dtype.
+</ResponseField>
+
+<ResponseField name="f32" type="fn(shape: Vec<usize>) -> TensorType">
+  Shorthand for `TensorType::new(shape, DType::F32)`.
+</ResponseField>
+
+<ResponseField name="num_elements" type="fn(&self) -> usize">
+  Product of all shape dimensions. A `[32, 784]` tensor has `25088` elements.
+</ResponseField>
+
+<ResponseField name="size_bytes" type="fn(&self) -> usize">
+  Total byte size: `num_elements() * dtype.size_bytes()`.
+</ResponseField>
+
+<ResponseField name="rank" type="fn(&self) -> usize">
+  Number of dimensions. `TensorType::f32(vec![4, 3]).rank()` returns `2`.
+</ResponseField>
+
+---
+
+### `Node`
+
+```rust
+pub struct Node {
+    pub id: NodeId,
+    pub op: Op,
+    pub inputs: Vec<NodeId>,
+    pub ty: TensorType,
+}
+```
+
+A single node in the computation graph.
+
+<ResponseField name="id" type="NodeId">
+  The node's unique index within its graph.
+</ResponseField>
+
+<ResponseField name="op" type="Op">
+  The operation this node computes.
+</ResponseField>
+
+<ResponseField name="inputs" type="Vec<NodeId>">
+  Ordered list of input node IDs.
+</ResponseField>
+
+<ResponseField name="ty" type="TensorType">
+  Shape and dtype of the output tensor produced by this node.
+</ResponseField>
+
+---
+
+## `Graph`
+
+```rust
+pub struct Graph { /* ... */ }
+```
+
+### Constructor
+
+<ResponseField name="new" type="fn() -> Graph">
+  Creates an empty graph with no nodes and no outputs.
+
+  ```rust
+  let mut g = Graph::new();
+  ```
+</ResponseField>
+
+---
+
+## Leaf nodes
+
+Leaf nodes have no inputs. They represent data entering the graph from outside: runtime inputs, trainable weights, or fixed constants.
+
+### `input`
+
+<ParamField path="name" type="&str" required>
+  Name used to identify this input when calling `session.set_input()`.
+</ParamField>
+<ParamField path="shape" type="&[usize]" required>
+  Shape of the input tensor. Creates a `DType::F32` tensor.
+</ParamField>
+
+Returns a `NodeId`. The session must supply data for this name before each forward pass.
+
+```rust
+let x = g.input("x", &[4, 784]);
+```
+
+---
+
+### `input_u32`
+
+Like `input`, but creates a `DType::U32` tensor. Used for token IDs and position indices.
+
+<ParamField path="name" type="&str" required>
+  Name used with `session.set_input_u32()`.
+</ParamField>
+<ParamField path="shape" type="&[usize]" required>
+  Shape of the input tensor.
+</ParamField>
+
+```rust
+let tokens = g.input_u32("tokens", &[32]);
+```
+
+---
+
+### `parameter`
+
+<ParamField path="name" type="&str" required>
+  Name used with `session.set_parameter()` and `session.get_parameter()`.
+</ParamField>
+<ParamField path="shape" type="&[usize]" required>
+  Shape of the parameter tensor. Always `DType::F32`.
+</ParamField>
+
+Creates a trainable parameter node. The optimizer updates this buffer after each backward pass.
+
+```rust
+let w = g.parameter("w", &[784, 128]);
+let b = g.parameter("b", &[128]);
+```
+
+---
+
+### `constant`
+
+<ParamField path="data" type="Vec<f32>" required>
+  Initial values. Length must equal the product of all shape dimensions.
+</ParamField>
+<ParamField path="shape" type="&[usize]" required>
+  Shape of the constant tensor.
+</ParamField>
+
+Creates a fixed-value node. The data is uploaded to GPU at session creation and never changes.
+
+```rust
+let c = g.constant(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]);
+```
+
+---
+
+### `scalar`
+
+<ParamField path="value" type="f32" required>
+  The scalar value.
+</ParamField>
+
+Shorthand for `constant(vec![value], &[1])`.
+
+```rust
+let scale = g.scalar(0.5);
+```
+
+---
+
+## Binary ops
+
+### `matmul`
+
+Matrix multiplication: `C = A × B`.
+
+<ParamField path="a" type="NodeId" required>
+  Left matrix `[M, K]`.
+</ParamField>
+<ParamField path="b" type="NodeId" required>
+  Right matrix `[K, N]`.
+</ParamField>
+
+Returns `[M, N]`. Both inputs must be 2D and their inner dimensions must match.
+
+```rust
+let y = g.matmul(x, w); // x: [4, 784], w: [784, 128] → [4, 128]
+```
+
+---
+
+### `matmul_at`
+
+Transposed-A matrix multiplication: `C = A^T × B`.
+
+<ParamField path="a" type="NodeId" required>
+  Matrix stored as `[K, M]`.
+</ParamField>
+<ParamField path="b" type="NodeId" required>
+  Matrix stored as `[K, N]`.
+</ParamField>
+
+Returns `[M, N]`. K dimensions of A and B must match.
+
+---
+
+### `matmul_bt`
+
+Transposed-B matrix multiplication: `C = A × B^T`.
+
+<ParamField path="a" type="NodeId" required>
+  Matrix `[M, K]`.
+</ParamField>
+<ParamField path="b" type="NodeId" required>
+  Matrix stored as `[N, K]`.
+</ParamField>
+
+Returns `[M, N]`. K dimensions of A and B must match.
+
+---
+
+### `add`
+
+Element-wise addition. Both inputs must have identical shapes.
+
+<ParamField path="a" type="NodeId" required>Tensor.</ParamField>
+<ParamField path="b" type="NodeId" required>Tensor with same shape as `a`.</ParamField>
+
+---
+
+### `mul`
+
+Element-wise multiplication. Both inputs must have identical shapes.
+
+<ParamField path="a" type="NodeId" required>Tensor.</ParamField>
+<ParamField path="b" type="NodeId" required>Tensor with same shape as `a`.</ParamField>
+
+---
+
+### `bias_add`
+
+Adds a 1D bias to a 2D input: `[M, N] + [N] → [M, N]`.
+
+<ParamField path="a" type="NodeId" required>
+  2D input tensor `[M, N]`.
+</ParamField>
+<ParamField path="bias" type="NodeId" required>
+  1D bias tensor `[N]`.
+</ParamField>
+
+```rust
+let h = g.bias_add(mm, b); // mm: [4, 128], b: [128] → [4, 128]
+```
+
+---
+
+### `broadcast_add`
+
+Adds a `[1, N]` tensor across a `[M, N]` tensor. Uses the same underlying shader as `bias_add`.
+
+<ParamField path="a" type="NodeId" required>
+  2D input `[M, N]`.
+</ParamField>
+<ParamField path="b" type="NodeId" required>
+  2D addend `[1, N]`.
+</ParamField>
+
+---
+
+### `greater`
+
+Element-wise greater-than comparison. Returns 1.0 where `a > b`, 0.0 otherwise. Both inputs must have identical shapes.
+
+<ParamField path="a" type="NodeId" required>Tensor.</ParamField>
+<ParamField path="b" type="NodeId" required>Tensor with same shape as `a`.</ParamField>
+
+---
+
+## Unary ops
+
+All unary ops preserve the shape and dtype of their input.
+
+### `relu`
+
+Rectified linear unit: `max(0, x)`.
+
+### `sigmoid`
+
+Logistic sigmoid: `1 / (1 + exp(-x))`.
+
+### `neg`
+
+Element-wise negation: `-x`.
+
+### `abs`
+
+Element-wise absolute value: `|x|`.
+
+### `log`
+
+Element-wise natural logarithm: `ln(x)`.
+
+### `recip`
+
+Element-wise reciprocal: `1 / x`.
+
+### `div`
+
+Element-wise division: `a / b`. Implemented as `mul(a, recip(b))`.
+
+<ParamField path="a" type="NodeId" required>Numerator tensor.</ParamField>
+<ParamField path="b" type="NodeId" required>Denominator tensor. Must have the same shape as `a`.</ParamField>
+
+---
+
+## Reductions
+
+### `sum_all`
+
+Reduces all elements to a scalar: output shape is `[1]`.
+
+<ParamField path="x" type="NodeId" required>Input tensor of any shape.</ParamField>
+
+### `mean_all`
+
+Reduces all elements to their mean: output shape is `[1]`.
+
+<ParamField path="x" type="NodeId" required>Input tensor of any shape.</ParamField>
+
+### `softmax`
+
+Row-wise softmax. Output has the same shape as the input.
+
+<ParamField path="x" type="NodeId" required>2D input tensor `[batch, features]`.</ParamField>
+
+### `log_softmax`
+
+Numerically stable log-softmax. Output has the same shape as the input.
+
+<ParamField path="x" type="NodeId" required>2D input tensor `[batch, features]`.</ParamField>
+
+---
+
+## Loss functions
+
+All loss functions return a scalar `[1]` node.
+
+### `cross_entropy_loss`
+
+<ParamField path="logits" type="NodeId" required>
+  Raw (pre-softmax) scores `[batch, num_classes]`.
+</ParamField>
+<ParamField path="labels" type="NodeId" required>
+  Target distribution `[batch, num_classes]`. Must match the shape of `logits`.
+</ParamField>
+
+```rust
+let loss = g.cross_entropy_loss(logits, labels);
+g.set_outputs(vec![loss]);
+```
+
+---
+
+### `bce_loss`
+
+Binary cross-entropy: `-mean(t * log(p) + (1 - t) * log(1 - p))`.
+
+<ParamField path="pred" type="NodeId" required>
+  Predictions in `(0, 1)`, typically after `sigmoid`.
+</ParamField>
+<ParamField path="labels" type="NodeId" required>
+  Binary targets. Must match the shape of `pred`.
+</ParamField>
+
+---
+
+### `mse_loss`
+
+Mean squared error: `mean((pred - target)²)`.
+
+<ParamField path="pred" type="NodeId" required>Predictions.</ParamField>
+<ParamField path="target" type="NodeId" required>Targets. Must match the shape of `pred`.</ParamField>
+
+---
+
+### `l1_loss`
+
+Mean absolute error: `mean(|pred - target|)`.
+
+<ParamField path="pred" type="NodeId" required>Predictions.</ParamField>
+<ParamField path="target" type="NodeId" required>Targets. Must match the shape of `pred`.</ParamField>
+
+---
+
+## Transformer ops
+
+### `silu`
+
+SiLU activation: `x * sigmoid(x)`. Preserves shape.
+
+---
+
+### `swiglu`
+
+Fused SwiGLU: `silu(gate) * up`. Both inputs must have the same shape.
+
+<ParamField path="gate" type="NodeId" required>Gate tensor.</ParamField>
+<ParamField path="up" type="NodeId" required>Up-projection tensor. Same shape as `gate`.</ParamField>
+
+---
+
+### `rms_norm`
+
+RMS normalization: `x / sqrt(mean(x²) + eps) * weight`.
+
+<ParamField path="x" type="NodeId" required>
+  2D input `[M, N]`.
+</ParamField>
+<ParamField path="weight" type="NodeId" required>
+  1D scale parameter `[N]`.
+</ParamField>
+<ParamField path="eps" type="f32" required>
+  Small constant for numerical stability (e.g. `1e-5`).
+</ParamField>
+
+```rust
+let w_norm = g.parameter("norm.weight", &[hidden_dim]);
+let normed = g.rms_norm(x, w_norm, 1e-5);
+```
+
+---
+
+### `rope`
+
+Rotary position embeddings applied to a 2D tensor. Position index for row `i` is `i`.
+
+<ParamField path="x" type="NodeId" required>
+  2D input `[seq, dim]`. `dim` must be even and divisible by `head_dim`.
+</ParamField>
+<ParamField path="theta" type="f32" required>
+  Rotary base frequency (e.g. `10000.0`).
+</ParamField>
+<ParamField path="head_dim" type="u32" required>
+  Size of each attention head. RoPE rotations are applied independently per head.
+</ParamField>
+
+---
+
+### `rope_with_offset`
+
+RoPE with a static position offset. Position for row `i` is `i + pos_offset`.
+
+<ParamField path="x" type="NodeId" required>2D input `[seq, dim]`.</ParamField>
+<ParamField path="theta" type="f32" required>Rotary base frequency.</ParamField>
+<ParamField path="pos_offset" type="u32" required>Static offset added to each row's position.</ParamField>
+<ParamField path="head_dim" type="u32" required>Attention head dimension.</ParamField>
+
+---
+
+### `rope_dynamic_offset`
+
+RoPE with a dynamic position offset read from a `U32` input buffer at runtime. Position for row `i` is `i + offset_buf[0]`.
+
+<ParamField path="x" type="NodeId" required>2D input `[seq, dim]`.</ParamField>
+<ParamField path="theta" type="f32" required>Rotary base frequency.</ParamField>
+<ParamField path="offset_input" type="NodeId" required>
+  A `U32` input node whose first element is added to each row's position index.
+</ParamField>
+<ParamField path="head_dim" type="u32" required>Attention head dimension.</ParamField>
+
+---
+
+### `causal_attention`
+
+Fused causal multi-head attention with optional GQA. Applies a causal mask so each token attends only to itself and earlier tokens.
+
+<ParamField path="q" type="NodeId" required>`[seq, num_heads * head_dim]`</ParamField>
+<ParamField path="k" type="NodeId" required>`[seq, num_kv_heads * head_dim]`</ParamField>
+<ParamField path="v" type="NodeId" required>`[seq, num_kv_heads * head_dim]`</ParamField>
+<ParamField path="num_heads" type="u32" required>Number of query heads.</ParamField>
+<ParamField path="num_kv_heads" type="u32" required>Number of key/value heads. Set equal to `num_heads` for standard MHA.</ParamField>
+<ParamField path="head_dim" type="u32" required>Dimension per head.</ParamField>
+
+Returns `[seq, num_heads * head_dim]`.
+
+---
+
+### `full_attention`
+
+Non-causal (bidirectional) multi-head attention. Same signature as `causal_attention` but without the causal mask.
+
+---
+
+### `cross_attention`
+
+Cross-attention where query attends to key/value from a different sequence.
+
+<ParamField path="q" type="NodeId" required>`[q_seq, num_heads * head_dim]`</ParamField>
+<ParamField path="k" type="NodeId" required>`[kv_seq, num_kv_heads * head_dim]`</ParamField>
+<ParamField path="v" type="NodeId" required>`[kv_seq, num_kv_heads * head_dim]`</ParamField>
+<ParamField path="num_heads" type="u32" required>Number of query heads.</ParamField>
+<ParamField path="num_kv_heads" type="u32" required>Number of key/value heads.</ParamField>
+<ParamField path="head_dim" type="u32" required>Dimension per head.</ParamField>
+
+Returns `[q_seq, num_heads * head_dim]`.
+
+---
+
+### `multi_head_attn`
+
+Differentiable multi-head attention that saves the log-sum-exp (LSE) tensor needed for the backward pass. Supports both self-attention and cross-attention via `is_cross`.
+
+<ParamField path="q" type="NodeId" required>`[q_seq, num_heads * head_dim]`</ParamField>
+<ParamField path="k" type="NodeId" required>`[kv_seq, num_kv_heads * head_dim]`</ParamField>
+<ParamField path="v" type="NodeId" required>`[kv_seq, num_kv_heads * head_dim]`</ParamField>
+<ParamField path="num_heads" type="u32" required>Number of query heads.</ParamField>
+<ParamField path="num_kv_heads" type="u32" required>Number of key/value heads.</ParamField>
+<ParamField path="head_dim" type="u32" required>Dimension per head.</ParamField>
+<ParamField path="is_cross" type="bool" required>
+  `true` for cross-attention (q_seq ≠ kv_seq), `false` for self-attention.
+</ParamField>
+
+Returns `[q_seq, num_heads * head_dim]`.
+
+---
+
+### `embedding`
+
+Looks up rows in an embedding table by index.
+
+<ParamField path="indices" type="NodeId" required>
+  1D `U32` tensor `[seq_len]` containing row indices.
+</ParamField>
+<ParamField path="table" type="NodeId" required>
+  2D `F32` parameter `[vocab_size, embed_dim]`.
+</ParamField>
+
+Returns `[seq_len, embed_dim]`.
+
+```rust
+let tokens = g.input_u32("tokens", &[seq_len]);
+let embed_table = g.parameter("embed.weight", &[vocab_size, hidden]);
+let embeds = g.embedding(tokens, embed_table);
+```
+
+---
+
+### `scatter_add`
+
+Accumulates source rows into an output tensor indexed by indices: `output[indices[i]] += src[i]`.
+
+<ParamField path="indices" type="NodeId" required>1D `U32` index tensor.</ParamField>
+<ParamField path="src" type="NodeId" required>2D source tensor `[seq_len, embed_dim]`.</ParamField>
+<ParamField path="vocab_size" type="usize" required>Number of rows in the output tensor.</ParamField>
+
+Returns `[vocab_size, embed_dim]`.
+
+---
+
+## Normalization
+
+### `layer_norm`
+
+Standard layer normalization: `(x - mean) / sqrt(var + eps) * weight + bias`.
+
+<ParamField path="x" type="NodeId" required>2D input `[M, N]`.</ParamField>
+<ParamField path="weight" type="NodeId" required>1D scale parameter `[N]`.</ParamField>
+<ParamField path="bias" type="NodeId" required>1D bias parameter `[N]`.</ParamField>
+<ParamField path="eps" type="f32" required>Stability constant (e.g. `1e-5`).</ParamField>
+
+Returns `[M, N]`.
+
+```rust
+let w = g.parameter("ln.weight", &[hidden]);
+let b = g.parameter("ln.bias", &[hidden]);
+let out = g.layer_norm(x, w, b, 1e-5);
+```
+
+---
+
+## Convolution
+
+### `conv2d`
+
+2D convolution. Input and output tensors are flat 1D arrays in NCHW order.
+
+<ParamField path="input" type="NodeId" required>Flat input `[N * C_in * H * W]`.</ParamField>
+<ParamField path="kernel" type="NodeId" required>Flat kernel `[C_out * C_in * kH * kW]`.</ParamField>
+<ParamField path="batch" type="u32" required>Batch size N.</ParamField>
+<ParamField path="in_channels" type="u32" required>Input channel count.</ParamField>
+<ParamField path="in_h" type="u32" required>Input height.</ParamField>
+<ParamField path="in_w" type="u32" required>Input width.</ParamField>
+<ParamField path="out_channels" type="u32" required>Output channel count.</ParamField>
+<ParamField path="kernel_h" type="u32" required>Kernel height.</ParamField>
+<ParamField path="kernel_w" type="u32" required>Kernel width.</ParamField>
+<ParamField path="stride" type="u32" required>Convolution stride.</ParamField>
+<ParamField path="padding" type="u32" required>Zero-padding on each spatial edge.</ParamField>
+
+Returns a flat `[N * C_out * out_H * out_W]` tensor.
+
+---
+
+### `group_norm`
+
+Group normalization over a flat NCHW tensor.
+
+<ParamField path="x" type="NodeId" required>Flat input `[N * C * H * W]`.</ParamField>
+<ParamField path="weight" type="NodeId" required>Scale `[C]`.</ParamField>
+<ParamField path="bias" type="NodeId" required>Bias `[C]`.</ParamField>
+<ParamField path="_batch" type="u32" required>Batch size (passed for dispatch sizing).</ParamField>
+<ParamField path="channels" type="u32" required>Channel count C.</ParamField>
+<ParamField path="spatial" type="u32" required>H × W.</ParamField>
+<ParamField path="num_groups" type="u32" required>Number of groups to normalize over.</ParamField>
+<ParamField path="eps" type="f32" required>Stability constant.</ParamField>
+
+---
+
+### `concat`
+
+Concatenates two tensors along the channel dimension (NCHW layout).
+
+<ParamField path="a" type="NodeId" required>First flat tensor `[N * Ca * H * W]`.</ParamField>
+<ParamField path="b" type="NodeId" required>Second flat tensor `[N * Cb * H * W]`.</ParamField>
+<ParamField path="batch" type="u32" required>Batch size N.</ParamField>
+<ParamField path="channels_a" type="u32" required>Channel count of `a`.</ParamField>
+<ParamField path="channels_b" type="u32" required>Channel count of `b`.</ParamField>
+<ParamField path="spatial" type="u32" required>H × W.</ParamField>
+
+Returns `[N * (Ca + Cb) * H * W]`.
+
+---
+
+### `split_a`
+
+Extracts the first `channels_a` channels from a concatenated NCHW tensor.
+
+<ParamField path="x" type="NodeId" required>Flat tensor `[N * (Ca + Cb) * H * W]`.</ParamField>
+<ParamField path="batch" type="u32" required>Batch size N.</ParamField>
+<ParamField path="channels_a" type="u32" required>Channels to extract.</ParamField>
+<ParamField path="channels_b" type="u32" required>Remaining channels.</ParamField>
+<ParamField path="spatial" type="u32" required>H × W.</ParamField>
+
+Returns `[N * Ca * H * W]`.
+
+---
+
+### `split_b`
+
+Extracts the last `channels_b` channels from a concatenated NCHW tensor. Same parameters as `split_a`.
+
+---
+
+### `upsample_2x`
+
+Nearest-neighbor 2× upsampling: `[N, C, H, W] → [N, C, 2H, 2W]`.
+
+<ParamField path="x" type="NodeId" required>Flat input tensor.</ParamField>
+<ParamField path="batch" type="u32" required>Batch size N.</ParamField>
+<ParamField path="channels" type="u32" required>Channel count C.</ParamField>
+<ParamField path="in_h" type="u32" required>Input height H.</ParamField>
+<ParamField path="in_w" type="u32" required>Input width W.</ParamField>
+
+---
+
+## KV cache
+
+### `cache_write`
+
+Writes a single-row tensor `new_kv [1, dim]` into row `kv_pos` of a cache buffer `cache [max_seq, dim]`.
+
+<ParamField path="new_kv" type="NodeId" required>New key or value `[1, dim]`.</ParamField>
+<ParamField path="cache" type="NodeId" required>Cache buffer `[max_seq, dim]`.</ParamField>
+<ParamField path="kv_pos" type="NodeId" required>
+  `U32` scalar input node indicating the position to write.
+</ParamField>
+
+Returns a node referencing the updated cache buffer.
+
+---
+
+### `cached_attention`
+
+Attention where Q comes from the current token and K/V come from a pre-filled cache.
+
+<ParamField path="q" type="NodeId" required>`[1, num_heads * head_dim]` — current query.</ParamField>
+<ParamField path="k_cache" type="NodeId" required>`[max_seq, kv_dim]` — key cache.</ParamField>
+<ParamField path="v_cache" type="NodeId" required>`[max_seq, kv_dim]` — value cache.</ParamField>
+<ParamField path="kv_pos" type="NodeId" required>
+  `U32` scalar node containing the number of valid positions in the cache.
+</ParamField>
+<ParamField path="num_heads" type="u32" required>Number of query heads.</ParamField>
+<ParamField path="num_kv_heads" type="u32" required>Number of key/value heads.</ParamField>
+<ParamField path="head_dim" type="u32" required>Dimension per head.</ParamField>
+
+Returns `[1, num_heads * head_dim]`.
+
+---
+
+## Utility methods
+
+### `set_outputs`
+
+<ParamField path="outputs" type="Vec<NodeId>" required>
+  Node IDs to mark as graph outputs. The session will make these buffers readable.
+</ParamField>
+
+```rust
+g.set_outputs(vec![loss]);
+```
+
+---
+
+### `outputs`
+
+Returns `&[NodeId]` — the list of output node IDs previously set with `set_outputs`.
+
+---
+
+### `nodes`
+
+Returns `&[Node]` — all nodes in the graph, indexed by their `NodeId`.
+
+---
+
+### `node`
+
+<ParamField path="id" type="NodeId" required>Node to retrieve.</ParamField>
+
+Returns `&Node`.
+
+---
+
+### `toposort`
+
+Rebuilds the graph in topological order, removing `Nop` (dead) nodes and compacting IDs. Returns a new `Graph` where every node's input IDs are strictly less than its own ID.
+
+```rust
+let sorted = graph.toposort();
+```
+
+This is called automatically by `build_session` before running autodiff.

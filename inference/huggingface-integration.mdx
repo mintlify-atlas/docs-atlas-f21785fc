@@ -1,0 +1,231 @@
+---
+title: 'HuggingFace integration'
+description: 'Load safetensors weights from local files or directly from the HuggingFace Hub using SafeTensorsModel.'
+keywords: ['huggingface', 'safetensors', 'weights', 'download', 'set_parameter', 'bf16', 'hf-hub']
+---
+
+Meganeura ships a `SafeTensorsModel` struct in `src/data/safetensors.rs` that loads named tensors from `.safetensors` files. You can point it at a local file or let it download directly from the HuggingFace Hub. Once loaded, you map each tensor to a graph parameter with `session.set_parameter`.
+
+## Loading a model
+
+<CardGroup cols={2}>
+  <Card title="From the Hub" icon="cloud-arrow-down">
+    Download `model.safetensors` from a HuggingFace repository ID. The file is cached locally after the first download (via `hf-hub`).
+
+    ```rust
+    use meganeura::data::safetensors::SafeTensorsModel;
+
+    let model = SafeTensorsModel::download("dacorvo/mnist-mlp")
+        .expect("failed to download model");
+    ```
+  </Card>
+  <Card title="From a local file" icon="folder-open">
+    Load from a `PathBuf` pointing to a local `.safetensors` file. No network access required.
+
+    ```rust
+    use meganeura::data::safetensors::SafeTensorsModel;
+    use std::path::PathBuf;
+
+    let model = SafeTensorsModel::load(PathBuf::from("model.safetensors"))
+        .expect("failed to load model");
+    ```
+  </Card>
+</CardGroup>
+
+Both methods return `Result<SafeTensorsModel, Box<dyn std::error::Error>>`. The model stores the raw file bytes in memory and caches tensor metadata (name, shape, dtype) in a `HashMap`.
+
+<Note>
+`SafeTensorsModel::download` downloads `model.safetensors` from the repo. To download a different filename, use `SafeTensorsModel::download_file(repo_id, filename)`.
+</Note>
+
+## Inspecting tensor metadata
+
+Call `tensor_info()` to get a `&HashMap<String, TensorInfo>` mapping tensor names to their shape and dtype. Use this to enumerate the checkpoint contents or verify that expected tensors are present before loading.
+
+```rust
+println!("model tensors:");
+let mut names: Vec<_> = model.tensor_info().keys().collect();
+names.sort();
+for name in &names {
+    let info = &model.tensor_info()[*name];
+    println!("  {}: shape={:?} dtype={:?}", name, info.shape, info.dtype);
+}
+```
+
+`TensorInfo` has two public fields:
+
+```rust
+pub struct TensorInfo {
+    pub shape: Vec<usize>,
+    pub dtype: safetensors::Dtype,  // F32, BF16, F16, …
+}
+```
+
+## Reading tensor data
+
+Three methods read a tensor as `Vec<f32>`:
+
+| Method | Input dtype | Transposed? |
+|---|---|---|
+| `tensor_f32(name)` | F32 only | No |
+| `tensor_f32_auto(name)` | F32 or BF16 | No |
+| `tensor_f32_auto_transposed(name)` | F32 or BF16 | Yes (2D tensors only) |
+| `tensor_f32_transposed(name)` | F32 only | Yes (2D tensors only) |
+
+Most modern HuggingFace models store weights as BF16. Use `tensor_f32_auto` or `tensor_f32_auto_transposed` to handle both dtypes transparently.
+
+## Transposing linear layer weights
+
+PyTorch stores linear layer weights as `[out_features, in_features]`. Meganeura's `matmul` expects `[in_features, out_features]`. You must transpose these weights on load.
+
+```rust
+// Transpose on load — PyTorch Linear weight [out, in] → meganeura [in, out]
+let data = model.tensor_f32_auto_transposed("input_layer.weight")
+    .expect("failed to load weight");
+session.set_parameter("input_layer.weight", &data);
+
+// Bias vectors are 1D — no transposition needed
+let bias = model.tensor_f32_auto("input_layer.bias")
+    .expect("failed to load bias");
+session.set_parameter("input_layer.bias", &bias);
+```
+
+<Warning>
+Loading a weight with the wrong orientation produces silently incorrect outputs. Check the `shape` field in `TensorInfo` to confirm which dimension is larger — the output dimension should be first in a PyTorch linear weight.
+</Warning>
+
+## Parameter naming convention
+
+Meganeura's built-in models use exactly the same parameter names as the corresponding HuggingFace safetensors checkpoints. You can load weights without any name remapping.
+
+For SmolLM2, the parameter names follow the HuggingFace convention:
+
+```
+model.embed_tokens.weight
+model.layers.0.input_layernorm.weight
+model.layers.0.self_attn.q_proj.weight
+model.layers.0.self_attn.k_proj.weight
+model.layers.0.self_attn.v_proj.weight
+model.layers.0.self_attn.o_proj.weight
+model.layers.0.post_attention_layernorm.weight
+model.layers.0.mlp.gate_proj.weight
+model.layers.0.mlp.up_proj.weight
+model.layers.0.mlp.down_proj.weight
+...
+model.norm.weight
+lm_head.weight
+```
+
+Each model module exposes a `transposed_weight_names` helper that returns the list of tensors that need transposition (all linear projection weights). Use it to avoid hard-coding the transpose logic:
+
+```rust
+use meganeura::models::smollm2;
+
+let transposed = smollm2::transposed_weight_names(&config);
+let transposed_set: std::collections::HashSet<&str> =
+    transposed.iter().map(|s| s.as_str()).collect();
+
+for (name, _) in session.plan().param_buffers.clone() {
+    let data = if transposed_set.contains(name.as_str()) {
+        model.tensor_f32_auto_transposed(&name)
+    } else {
+        model.tensor_f32_auto(&name)
+    };
+    session.set_parameter(&name, &data.unwrap_or_else(|e| panic!("{}: {}", name, e)));
+}
+```
+
+## Weight-tied parameters
+
+Some models share the language-model head with the token embedding table (weight tying). When the safetensors file does not contain a separate `lm_head.weight` tensor, load `model.embed_tokens.weight` and transpose it into the `lm_head.weight` parameter slot:
+
+```rust
+if model.tensor_info().contains_key("lm_head.weight") {
+    let data = model.tensor_f32_auto_transposed("lm_head.weight")?;
+    session.set_parameter("lm_head.weight", &data);
+} else {
+    // Tied weights: reuse embed_tokens transposed
+    let data = model.tensor_f32_auto_transposed("model.embed_tokens.weight")?;
+    session.set_parameter("lm_head.weight", &data);
+}
+```
+
+## Full flow from `examples/huggingface.rs`
+
+The following is the complete load-and-infer flow from the `huggingface` example. It downloads `dacorvo/mnist-mlp`, builds a three-layer MLP inference graph, loads weights, and classifies MNIST test images.
+
+```rust
+use meganeura::{Graph, build_inference_session};
+use meganeura::data::safetensors::SafeTensorsModel;
+use std::path::PathBuf;
+
+// Load model — CLI path or download from Hub
+let hf = if let Some(path) = std::env::args().nth(1) {
+    SafeTensorsModel::load(PathBuf::from(path)).expect("failed to load model")
+} else {
+    SafeTensorsModel::download("dacorvo/mnist-mlp").expect("failed to download model")
+};
+
+// Inspect tensors
+let mut names: Vec<_> = hf.tensor_info().keys().collect();
+names.sort();
+for name in &names {
+    let info = &hf.tensor_info()[*name];
+    println!("  {}: shape={:?} dtype={:?}", name, info.shape, info.dtype);
+}
+
+// Build the inference graph (784 → 256 → 256 → 10)
+let mut g = Graph::new();
+let x      = g.input("x", &[1, 784]);
+let w1     = g.parameter("input_layer.weight",  &[784, 256]);
+let b1     = g.parameter("input_layer.bias",    &[256]);
+let h1     = g.relu(g.bias_add(g.matmul(x, w1), b1));
+let w2     = g.parameter("mid_layer.weight",    &[256, 256]);
+let b2     = g.parameter("mid_layer.bias",      &[256]);
+let h2     = g.relu(g.bias_add(g.matmul(h1, w2), b2));
+let w3     = g.parameter("output_layer.weight", &[256, 10]);
+let b3     = g.parameter("output_layer.bias",   &[10]);
+let logits = g.bias_add(g.matmul(h2, w3), b3);
+let probs  = g.softmax(logits);
+g.set_outputs(vec![probs]);
+
+let mut session = build_inference_session(&g);
+
+// Load weights — linear weights need transposing, biases do not
+for name in ["input_layer.weight", "mid_layer.weight", "output_layer.weight"] {
+    let data = hf.tensor_f32_transposed(name)
+        .unwrap_or_else(|e| panic!("failed to load {}: {}", name, e));
+    session.set_parameter(name, &data);
+}
+for name in ["input_layer.bias", "mid_layer.bias", "output_layer.bias"] {
+    let data = hf.tensor_f32(name)
+        .unwrap_or_else(|e| panic!("failed to load {}: {}", name, e));
+    session.set_parameter(name, &data);
+}
+
+// Run inference on a single normalized image
+let image: Vec<f32> = raw_pixels.iter()
+    .map(|&v| (v - 0.1307) / 0.3081)
+    .collect();
+session.set_input("x", &image);
+session.step();
+session.wait();
+
+let probs = session.read_output(10);
+let predicted = probs.iter()
+    .enumerate()
+    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+    .unwrap()
+    .0;
+```
+
+## `hf-hub` and TLS
+
+`SafeTensorsModel::download` uses the `hf-hub` crate internally. By default, `hf-hub` requires a TLS backend for HTTPS connections. Meganeura enables the `native-tls` feature of `hf-hub`, which uses the platform-native TLS library (OpenSSL on Linux, Secure Transport on macOS, SChannel on Windows). No additional configuration is needed for most environments.
+
+Meganeura uses the synchronous `ureq`-based API from `hf-hub` with `native-tls`. The relevant dependency in `Cargo.toml`:
+
+```toml
+[dependencies]
+hf-hub = { version = "0.4", default-features = false, features = ["ureq", "native-tls"] }
+```

@@ -1,24 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "Meganeura",
+  "projectType": "ai-ml",
+  "projectName": "Meganeura",
+  "projectDescription": "A cross-platform Rust library for GPU-accelerated neural network training and inference, using e-graph (egglog) optimization and blade-graphics for portable GPU access across Vulkan and Metal.",
   "theme": "luma",
-  "colors": {
-    "primary": "#7c7c7c",
-    "light": "#121212",
-    "dark": "#c9c9c9"
-  },
-  "favicon": "/favicon.svg",
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/kvark/meganeura"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/kvark/meganeura"
-    }
-  },
+  "primaryColor": "#7c7c7c",
+  "lightColor": "#121212",
+  "darkColor": "#c9c9c9",
   "navigation": {
     "tabs": [
       {
@@ -106,5 +93,48 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Cross-platform GPU acceleration via blade-graphics (Vulkan + Metal)",
+    "E-graph (egglog) based kernel fusion and optimization",
+    "Automatic differentiation for full training support",
+    "Zero-compile-time model execution (no JIT warmup)",
+    "HuggingFace safetensors weight loading",
+    "KV-cache for efficient autoregressive inference",
+    "Built-in transformer primitives (GQA, RoPE, RMSNorm, SwiGLU)",
+    "Perfetto trace profiling support"
+  ],
+  "publicApiSurface": [
+    "Graph",
+    "NodeId",
+    "DType",
+    "TensorType",
+    "Session",
+    "MemorySummary",
+    "Trainer",
+    "TrainConfig",
+    "Optimizer",
+    "TrainHistory",
+    "EpochStats",
+    "StepMetrics",
+    "MetricCallback",
+    "LossHistory",
+    "DataLoader",
+    "MnistDataset",
+    "OptimizeReport",
+    "build_session",
+    "build_inference_session",
+    "build_session_cached",
+    "build_session_with_report",
+    "compile_training_graph",
+    "nn::Linear",
+    "nn::Embedding",
+    "nn::RmsNorm",
+    "nn::LayerNorm",
+    "nn::SwiGluFfn",
+    "nn::Mlp",
+    "nn::Conv2d",
+    "nn::CausalSelfAttention",
+    "nn::TransformerBlock"
+  ]
 }

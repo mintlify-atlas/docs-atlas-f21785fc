@@ -1,0 +1,88 @@
+---
+title: "System requirements"
+description: "Supported GPUs, drivers, operating systems, and Rust versions for running Meganeura."
+keywords: ["meganeura", "system requirements", "vulkan", "metal", "gpu", "nvidia", "amd", "intel", "apple silicon"]
+---
+
+Meganeura runs on any device with Vulkan or Metal support. Performance is best when the GPU and driver support hardware-accelerated cooperative matrix operations, but the library functions correctly without them — including on CPU via LavaPipe.
+
+## Rust version
+
+Meganeura requires **Rust 1.88** or later.
+
+```bash
+rustc --version   # should print rustc 1.88.0 or higher
+rustup update     # update if needed
+```
+
+## Vulkan
+
+Meganeura uses Vulkan on Linux, Windows, and Android.
+
+### Best performance
+
+Cooperative matrix operations (`VK_KHR_cooperative_matrix`) enable hardware-accelerated 8×8 tile math for matmul-heavy workloads. The following GPUs support this extension:
+
+| Vendor | Minimum hardware |
+|--------|-----------------|
+| NVIDIA | Volta architecture (GeForce RTX 20 series+, Quadro V100+) |
+| AMD | RDNA3 architecture (Radeon RX 7000 series+) |
+| Intel | Arc graphics (A-series+) |
+
+<Tip>
+  Check whether your GPU supports `VK_KHR_cooperative_matrix` by running `vulkaninfo | grep cooperativeMatrix` or using the [Vulkan Hardware Database](https://vulkan.gpuinfo.org/).
+</Tip>
+
+### Runs on any Vulkan device
+
+Meganeura works on any GPU with a Vulkan driver, even without cooperative matrix support. This includes older NVIDIA, AMD, and Intel GPUs that predate the hardware requirements listed above.
+
+### LavaPipe (software rendering)
+
+[LavaPipe](https://docs.mesa3d.org/drivers/llvmpipe.html) is Mesa's software Vulkan implementation. Meganeura runs on LavaPipe for development, testing, or environments without a GPU. Performance is substantially lower than hardware execution.
+
+```bash
+# Force LavaPipe on Linux
+LIBGL_ALWAYS_SOFTWARE=1 cargo run --example mnist
+```
+
+<Warning>
+  LavaPipe is suitable for functional testing only. Do not use it for benchmarking or production inference.
+</Warning>
+
+## Metal
+
+Meganeura uses Metal on macOS and iOS.
+
+### Best performance
+
+Simdgroup matrix operations enable hardware-accelerated matrix math on Apple GPUs. Meganeura achieves best performance on:
+
+- **Apple M1** or later (all variants: M1, M1 Pro, M1 Max, M1 Ultra, M2, M3, M4, and their variants)
+
+All Apple Silicon Macs ship with Metal support and simdgroup matrix instructions. No additional drivers are required.
+
+### macOS version
+
+Apple Silicon Macs running macOS 12 Monterey or later are supported. Metal availability is tied to the OS version, not the hardware.
+
+## Platform summary
+
+| Platform | Backend | Notes |
+|----------|---------|-------|
+| Linux | Vulkan | NVIDIA, AMD, Intel, and LavaPipe |
+| Windows | Vulkan | NVIDIA, AMD, Intel |
+| macOS | Metal | Apple Silicon (M1+) recommended |
+| iOS | Metal | Apple Silicon |
+| Android | Vulkan | Device-dependent driver quality |
+
+<Note>
+  The benchmark table in the README shows measured forward and backward pass times for several GPUs. Meganeura outperforms PyTorch ROCm on AMD laptop APUs and matches PyTorch CUDA on mid-range NVIDIA hardware.
+</Note>
+
+## What is not supported
+
+- **CUDA** — Meganeura does not use CUDA. Use the Vulkan backend on NVIDIA GPUs.
+- **ROCm** — Meganeura does not use ROCm. Use the Vulkan backend with AMD RDNA drivers (RADV on Linux recommended).
+- **OpenCL** — Not supported.
+- **x86/ARM CPU** only — You can run on CPU via LavaPipe (Vulkan) but there is no native CPU backend.

@@ -1,0 +1,464 @@
+---
+title: 'Attention layers'
+description: 'Causal self-attention, cross-attention, KV-cache decode, and rotary position embedding ops.'
+keywords: ['attention', 'causal', 'cross-attention', 'rope', 'kv cache', 'grouped query attention', 'transformer']
+---
+
+Meganeura provides both a high-level `nn::CausalSelfAttention` struct and low-level `Graph` ops for every attention variant. The `nn::` struct is suitable for typical prefill paths in decoder models. Use the graph ops directly when you need non-causal, cross-attention, differentiable training, or decode-time KV-cache access.
+
+---
+
+## `nn::CausalSelfAttention`
+
+Causal self-attention with grouped-query attention (GQA) and rotary position embeddings (RoPE). All four projection matrices are bias-free.
+
+**Fields**
+
+<ParamField path="q_proj" type="Linear" required>
+  Query projection: `hidden → hidden`.
+</ParamField>
+
+<ParamField path="k_proj" type="Linear" required>
+  Key projection: `hidden → kv_dim`.
+</ParamField>
+
+<ParamField path="v_proj" type="Linear" required>
+  Value projection: `hidden → kv_dim`.
+</ParamField>
+
+<ParamField path="o_proj" type="Linear" required>
+  Output projection: `hidden → hidden`.
+</ParamField>
+
+<ParamField path="num_heads" type="u32" required>
+  Number of query attention heads.
+</ParamField>
+
+<ParamField path="num_kv_heads" type="u32" required>
+  Number of key/value heads. Must divide `num_heads` evenly (GQA).
+</ParamField>
+
+<ParamField path="head_dim" type="u32" required>
+  Dimension per head.
+</ParamField>
+
+<ParamField path="rope_theta" type="f32" required>
+  Base frequency for rotary position embeddings.
+</ParamField>
+
+### `AttentionConfig`
+
+```rust
+pub struct AttentionConfig {
+    pub hidden: usize,
+    pub kv_dim: usize,
+    pub num_heads: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub rope_theta: f32,
+}
+```
+
+<ParamField path="hidden" type="usize" required>
+  Model hidden dimension. Used for query, and output projection sizes.
+</ParamField>
+
+<ParamField path="kv_dim" type="usize" required>
+  Key/value projection dimension (`num_kv_heads * head_dim`).
+</ParamField>
+
+<ParamField path="num_heads" type="u32" required>
+  Number of query heads.
+</ParamField>
+
+<ParamField path="num_kv_heads" type="u32" required>
+  Number of key/value heads.
+</ParamField>
+
+<ParamField path="head_dim" type="u32" required>
+  Dimension per head.
+</ParamField>
+
+<ParamField path="rope_theta" type="f32" required>
+  RoPE base frequency (e.g. `10000.0` for standard, `500000.0` for Llama 3).
+</ParamField>
+
+### `CausalSelfAttention::new`
+
+<ParamField path="g" type="&mut Graph" required>
+  The computation graph to register parameters into.
+</ParamField>
+
+<ParamField path="name" type="&str" required>
+  Name prefix. Registers `{name}.q_proj`, `{name}.k_proj`, `{name}.v_proj`, `{name}.o_proj` weights.
+</ParamField>
+
+<ParamField path="cfg" type="&AttentionConfig" required>
+  Attention configuration struct.
+</ParamField>
+
+```rust
+let cfg = nn::AttentionConfig {
+    hidden: 512,
+    kv_dim: 128,
+    num_heads: 8,
+    num_kv_heads: 2,
+    head_dim: 64,
+    rope_theta: 10000.0,
+};
+let attn = nn::CausalSelfAttention::new(&mut g, "model.layers.0.self_attn", &cfg);
+```
+
+### `forward`
+
+Projects Q/K/V, applies RoPE to Q and K, then runs causal masked attention.
+
+Forward computation:
+```
+q = q_proj(x)         // [seq, hidden]
+k = k_proj(x)         // [seq, kv_dim]
+v = v_proj(x)         // [seq, kv_dim]
+q = rope(q, theta, head_dim)
+k = rope(k, theta, head_dim)
+attn = causal_attention(q, k, v, ...)
+out = o_proj(attn)    // [seq, hidden]
+```
+
+<ParamField path="g" type="&mut Graph" required>
+  The computation graph to append ops to.
+</ParamField>
+
+<ParamField path="x" type="NodeId" required>
+  Input tensor of shape `[seq, hidden]`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Output tensor of shape `[seq, hidden]`.
+</ResponseField>
+
+```rust
+let y = attn.forward(&mut g, x);
+// y shape: [seq, 512]
+```
+
+---
+
+## Graph attention ops
+
+All attention ops operate on 2D tensors. There are no explicit batch or head dimensions — sequences are flattened and heads are interleaved in the last dimension.
+
+### `g.causal_attention`
+
+Fused causal masked multi-head attention with GQA support. Intended for prefill (processing a full sequence at once).
+
+<ParamField path="q" type="NodeId" required>
+  Query tensor of shape `[seq, num_heads * head_dim]`.
+</ParamField>
+
+<ParamField path="k" type="NodeId" required>
+  Key tensor of shape `[seq, num_kv_heads * head_dim]`.
+</ParamField>
+
+<ParamField path="v" type="NodeId" required>
+  Value tensor of shape `[seq, num_kv_heads * head_dim]`.
+</ParamField>
+
+<ParamField path="num_heads" type="u32" required>
+  Number of query heads.
+</ParamField>
+
+<ParamField path="num_kv_heads" type="u32" required>
+  Number of key/value heads.
+</ParamField>
+
+<ParamField path="head_dim" type="u32" required>
+  Dimension per head.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Output tensor of shape `[seq, num_heads * head_dim]`.
+</ResponseField>
+
+```rust
+let attn = g.causal_attention(q, k, v, 8, 2, 64);
+```
+
+### `g.full_attention`
+
+Non-causal (bidirectional) multi-head attention with GQA support. Used in vision encoders and other encoder-only contexts where every token attends to every other token.
+
+<ParamField path="q" type="NodeId" required>
+  Query tensor of shape `[seq, num_heads * head_dim]`.
+</ParamField>
+
+<ParamField path="k" type="NodeId" required>
+  Key tensor of shape `[seq, num_kv_heads * head_dim]`.
+</ParamField>
+
+<ParamField path="v" type="NodeId" required>
+  Value tensor of shape `[seq, num_kv_heads * head_dim]`.
+</ParamField>
+
+<ParamField path="num_heads" type="u32" required>
+  Number of query heads.
+</ParamField>
+
+<ParamField path="num_kv_heads" type="u32" required>
+  Number of key/value heads.
+</ParamField>
+
+<ParamField path="head_dim" type="u32" required>
+  Dimension per head.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Output tensor of shape `[seq, num_heads * head_dim]`.
+</ResponseField>
+
+```rust
+// Vision encoder: every patch attends to every other patch
+let attn = g.full_attention(q, k, v, 16, 16, 64);
+```
+
+### `g.cross_attention`
+
+Cross-attention where the query sequence attends to a separate key/value sequence. Q and K/V may have different sequence lengths.
+
+<ParamField path="q" type="NodeId" required>
+  Query tensor of shape `[q_seq, num_heads * head_dim]`.
+</ParamField>
+
+<ParamField path="k" type="NodeId" required>
+  Key tensor of shape `[kv_seq, num_kv_heads * head_dim]`.
+</ParamField>
+
+<ParamField path="v" type="NodeId" required>
+  Value tensor of shape `[kv_seq, num_kv_heads * head_dim]`.
+</ParamField>
+
+<ParamField path="num_heads" type="u32" required>
+  Number of query heads.
+</ParamField>
+
+<ParamField path="num_kv_heads" type="u32" required>
+  Number of key/value heads.
+</ParamField>
+
+<ParamField path="head_dim" type="u32" required>
+  Dimension per head.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Output tensor of shape `[q_seq, num_heads * head_dim]`.
+</ResponseField>
+
+```rust
+// Decoder attending to encoder output
+let out = g.cross_attention(q_dec, k_enc, v_enc, 8, 8, 64);
+```
+
+### `g.multi_head_attn`
+
+Differentiable multi-head attention that saves the log-sum-exp (LSE) buffer needed for an exact backward pass. Use this variant when training.
+
+Handles both self-attention (`is_cross = false`) and cross-attention (`is_cross = true`). The autodiff engine uses `MultiHeadAttnGradQ/K/V` ops that reference the saved LSE.
+
+<ParamField path="q" type="NodeId" required>
+  Query tensor of shape `[q_seq, num_heads * head_dim]`.
+</ParamField>
+
+<ParamField path="k" type="NodeId" required>
+  Key tensor of shape `[kv_seq, num_kv_heads * head_dim]`.
+</ParamField>
+
+<ParamField path="v" type="NodeId" required>
+  Value tensor of shape `[kv_seq, num_kv_heads * head_dim]`.
+</ParamField>
+
+<ParamField path="num_heads" type="u32" required>
+  Number of query heads.
+</ParamField>
+
+<ParamField path="num_kv_heads" type="u32" required>
+  Number of key/value heads.
+</ParamField>
+
+<ParamField path="head_dim" type="u32" required>
+  Dimension per head.
+</ParamField>
+
+<ParamField path="is_cross" type="bool" required>
+  `false` for self-attention, `true` for cross-attention.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Output tensor of shape `[q_seq, num_heads * head_dim]`. An LSE buffer `[q_seq * num_heads]` is also allocated internally during compilation for backward use.
+</ResponseField>
+
+```rust
+// Training: differentiable self-attention
+let out = g.multi_head_attn(q, k, v, 8, 8, 64, false);
+```
+
+### `g.cached_attention`
+
+Decode-time attention where a single new query token attends to the entire KV cache. Requires `q` to have `seq_len = 1`.
+
+<ParamField path="q" type="NodeId" required>
+  Query tensor of shape `[1, num_heads * head_dim]`.
+</ParamField>
+
+<ParamField path="k_cache" type="NodeId" required>
+  Key cache buffer of shape `[max_seq, num_kv_heads * head_dim]`.
+</ParamField>
+
+<ParamField path="v_cache" type="NodeId" required>
+  Value cache buffer of shape `[max_seq, num_kv_heads * head_dim]`.
+</ParamField>
+
+<ParamField path="kv_pos" type="NodeId" required>
+  U32 scalar input: the number of valid positions currently stored in the cache.
+</ParamField>
+
+<ParamField path="num_heads" type="u32" required>
+  Number of query heads.
+</ParamField>
+
+<ParamField path="num_kv_heads" type="u32" required>
+  Number of key/value heads.
+</ParamField>
+
+<ParamField path="head_dim" type="u32" required>
+  Dimension per head.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Output tensor of shape `[1, num_heads * head_dim]`.
+</ResponseField>
+
+```rust
+let kv_pos = g.input_u32("kv_pos", &[1]);
+let out = g.cached_attention(q, k_cache, v_cache, kv_pos, 8, 2, 64);
+// out shape: [1, 512]
+```
+
+---
+
+## Rotary position embedding ops
+
+### `g.rope`
+
+Applies RoPE starting at position 0. Use for prefill.
+
+<ParamField path="x" type="NodeId" required>
+  2D input tensor of shape `[seq, dim]`. `dim` must be even and divisible by `head_dim`.
+</ParamField>
+
+<ParamField path="theta" type="f32" required>
+  RoPE base frequency.
+</ParamField>
+
+<ParamField path="head_dim" type="u32" required>
+  Dimension of each attention head. Rotations are applied independently within each head.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Rotated tensor, same shape `[seq, dim]`.
+</ResponseField>
+
+```rust
+let q = g.rope(q, 10000.0, 64);
+```
+
+### `g.rope_with_offset`
+
+Applies RoPE with a static position offset. Use when the current sequence starts at a known non-zero position.
+
+<ParamField path="x" type="NodeId" required>
+  2D input tensor of shape `[seq, dim]`.
+</ParamField>
+
+<ParamField path="theta" type="f32" required>
+  RoPE base frequency.
+</ParamField>
+
+<ParamField path="pos_offset" type="u32" required>
+  Static offset added to each row's position index.
+</ParamField>
+
+<ParamField path="head_dim" type="u32" required>
+  Dimension per head.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Rotated tensor, same shape `[seq, dim]`.
+</ResponseField>
+
+```rust
+// Apply RoPE starting at position 128
+let q = g.rope_with_offset(q, 10000.0, 128, 64);
+```
+
+### `g.rope_dynamic_offset`
+
+Applies RoPE with a position offset read at runtime from a U32 input buffer. Use for decode-time single-token inference where `kv_pos` is known only at runtime.
+
+<ParamField path="x" type="NodeId" required>
+  2D input tensor of shape `[seq, dim]`.
+</ParamField>
+
+<ParamField path="theta" type="f32" required>
+  RoPE base frequency.
+</ParamField>
+
+<ParamField path="offset_input" type="NodeId" required>
+  U32 scalar input. Its value is added to each row's position (`position = row_index + offset_input[0]`).
+</ParamField>
+
+<ParamField path="head_dim" type="u32" required>
+  Dimension per head.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Rotated tensor, same shape `[seq, dim]`.
+</ResponseField>
+
+```rust
+let kv_pos = g.input_u32("kv_pos", &[1]);
+let q = g.rope_dynamic_offset(q, 10000.0, kv_pos, 64);
+```
+
+---
+
+## KV cache write op
+
+### `g.cache_write`
+
+Writes a single new key or value row into a pre-allocated cache buffer at position `kv_pos`. Returns a node representing the updated cache.
+
+<ParamField path="new_kv" type="NodeId" required>
+  New key or value tensor of shape `[1, dim]`.
+</ParamField>
+
+<ParamField path="cache" type="NodeId" required>
+  Cache buffer of shape `[max_seq, dim]`.
+</ParamField>
+
+<ParamField path="kv_pos" type="NodeId" required>
+  U32 scalar input: the position index at which to write.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Updated cache buffer, same shape `[max_seq, dim]` as the input cache.
+</ResponseField>
+
+```rust
+let kv_pos = g.input_u32("kv_pos", &[1]);
+let k_cache = g.input("k_cache", &[max_seq, kv_dim]);
+let k_new = k_proj.forward(&mut g, x);  // shape [1, kv_dim]
+let k_cache = g.cache_write(k_new, k_cache, kv_pos);
+```
+
+<Note>
+  `cache_write` performs an in-place write at the GPU level. The returned `NodeId` aliases the cache buffer — use it (not the original cache input) as the source for subsequent `cached_attention` calls within the same graph.
+</Note>

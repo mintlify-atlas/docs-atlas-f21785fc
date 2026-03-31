@@ -1,0 +1,396 @@
+---
+title: "Trainer"
+description: "High-level training loop — drives the epoch → batch → step → optimizer update cycle."
+---
+
+The `Trainer` struct wraps a `Session` and a `DataLoader` and manages the training loop for you. It handles shuffling, batching, optimizer dispatch, and loss logging.
+
+```rust
+use meganeura::{Trainer, TrainConfig, Optimizer, build_session};
+
+let session = build_session(&graph);
+
+let config = TrainConfig {
+    optimizer: Optimizer::adam(1e-3),
+    log_interval: 100,
+    data_input: "x".into(),
+    label_input: "labels".into(),
+    ..Default::default()
+};
+
+let mut trainer = Trainer::new(session, config);
+let history = trainer.train(&mut loader, 10);
+println!("final loss: {:.4}", history.final_loss().unwrap());
+```
+
+---
+
+## `Optimizer`
+
+```rust
+#[derive(Clone, Debug)]
+pub enum Optimizer {
+    Sgd { learning_rate: f32 },
+    Adam {
+        learning_rate: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+    },
+}
+```
+
+Selects the optimization algorithm and its hyperparameters.
+
+<ResponseField name="Sgd" type="variant">
+  Stochastic gradient descent.
+
+  <Expandable title="fields">
+    <ResponseField name="learning_rate" type="f32">
+      Step size applied to each gradient update.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="Adam" type="variant">
+  Adaptive moment estimation optimizer.
+
+  <Expandable title="fields">
+    <ResponseField name="learning_rate" type="f32">
+      Step size.
+    </ResponseField>
+    <ResponseField name="beta1" type="f32">
+      First moment (mean) decay coefficient.
+    </ResponseField>
+    <ResponseField name="beta2" type="f32">
+      Second moment (variance) decay coefficient.
+    </ResponseField>
+    <ResponseField name="epsilon" type="f32">
+      Small constant for numerical stability.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Constructors
+
+#### `Optimizer::sgd`
+
+```rust
+pub fn sgd(lr: f32) -> Self
+```
+
+Creates an SGD optimizer with the given learning rate.
+
+```rust
+let opt = Optimizer::sgd(0.01);
+```
+
+---
+
+#### `Optimizer::adam`
+
+```rust
+pub fn adam(lr: f32) -> Self
+```
+
+Creates an Adam optimizer with standard defaults: `beta1 = 0.9`, `beta2 = 0.999`, `epsilon = 1e-8`.
+
+```rust
+let opt = Optimizer::adam(1e-3);
+```
+
+---
+
+## `TrainConfig`
+
+```rust
+pub struct TrainConfig {
+    pub optimizer: Optimizer,
+    pub learning_rate: f32,
+    pub log_interval: usize,
+    pub data_input: String,
+    pub label_input: String,
+}
+```
+
+Configuration for a `Trainer`. Implements `Default`.
+
+<ResponseField name="optimizer" type="Optimizer">
+  The optimizer to use. Defaults to `Optimizer::Sgd { learning_rate: 0.01 }`.
+</ResponseField>
+
+<ResponseField name="learning_rate" type="f32">
+  Backward-compatible SGD learning rate alias. Ignored when `optimizer` is set to `Adam`. Defaults to `0.01`.
+</ResponseField>
+
+<ResponseField name="log_interval" type="usize">
+  Print a loss line every this many steps. Set to `0` to disable step logging. Defaults to `100`.
+</ResponseField>
+
+<ResponseField name="data_input" type="String">
+  Name of the graph input node that receives sample data. Defaults to `"x"`.
+</ResponseField>
+
+<ResponseField name="label_input" type="String">
+  Name of the graph input node that receives labels. Defaults to `"labels"`.
+</ResponseField>
+
+### Default values
+
+```rust
+TrainConfig {
+    optimizer: Optimizer::Sgd { learning_rate: 0.01 },
+    learning_rate: 0.01,
+    log_interval: 100,
+    data_input: "x".into(),
+    label_input: "labels".into(),
+}
+```
+
+---
+
+## `Trainer`
+
+```rust
+pub struct Trainer {
+    session: Session,
+    config: TrainConfig,
+}
+```
+
+Drives the training loop over a `Session` and `DataLoader`.
+
+### `new`
+
+```rust
+pub fn new(session: Session, config: TrainConfig) -> Self
+```
+
+Creates a trainer from a compiled session and a training configuration.
+
+<ParamField path="session" type="Session" required>
+  A `Session` built with `build_session()`.
+</ParamField>
+<ParamField path="config" type="TrainConfig" required>
+  Training hyperparameters and input names.
+</ParamField>
+
+---
+
+### `train`
+
+```rust
+pub fn train(&mut self, loader: &mut DataLoader, epochs: usize) -> TrainHistory
+```
+
+Runs `epochs` full passes over the data. On each epoch:
+
+1. Shuffles the data loader with the epoch index as the RNG seed
+2. Iterates over all batches, uploading data and labels, running `step()` + `wait()`
+3. Logs the per-epoch average loss via `log::info!`
+
+Returns a `TrainHistory` containing per-epoch statistics.
+
+<ParamField path="loader" type="&mut DataLoader" required>
+  Data loader to iterate over. Reset and shuffled at the start of each epoch.
+</ParamField>
+<ParamField path="epochs" type="usize" required>
+  Number of full passes over the dataset.
+</ParamField>
+
+```rust
+let history = trainer.train(&mut loader, 20);
+```
+
+---
+
+### `train_epoch`
+
+```rust
+pub fn train_epoch(&mut self, loader: &mut DataLoader, epoch: usize) -> EpochStats
+```
+
+Runs a single epoch and returns its statistics. Useful when you need to interleave training with validation or other custom logic between epochs.
+
+<ParamField path="loader" type="&mut DataLoader" required>Data loader.</ParamField>
+<ParamField path="epoch" type="usize" required>Epoch index (used as the RNG seed for shuffling).</ParamField>
+
+```rust
+for epoch in 0..num_epochs {
+    let stats = trainer.train_epoch(&mut loader, epoch);
+    let val_loss = evaluate(&mut trainer.session_mut(), &val_data);
+    println!("epoch {}: train={:.4} val={:.4}", epoch, stats.avg_loss, val_loss);
+}
+```
+
+---
+
+### `session`
+
+```rust
+pub fn session(&self) -> &Session
+```
+
+Borrows the underlying session immutably (e.g. to read parameters).
+
+---
+
+### `session_mut`
+
+```rust
+pub fn session_mut(&mut self) -> &mut Session
+```
+
+Borrows the underlying session mutably (e.g. to set parameters, save checkpoints, or read outputs).
+
+```rust
+trainer.session_mut().save_checkpoint(Path::new("ckpt.safetensors"))?;
+```
+
+---
+
+### `into_session`
+
+```rust
+pub fn into_session(self) -> Session
+```
+
+Consumes the trainer and returns the inner session. Use this when training is complete and you want to run inference without rebuilding a session.
+
+```rust
+let session = trainer.into_session();
+// session is now available for inference
+```
+
+---
+
+## `TrainHistory`
+
+```rust
+#[derive(Clone, Debug, Default)]
+pub struct TrainHistory {
+    pub epochs: Vec<EpochStats>,
+}
+```
+
+Accumulated training history returned by `Trainer::train`.
+
+<ResponseField name="epochs" type="Vec<EpochStats>">
+  One `EpochStats` entry per completed epoch.
+</ResponseField>
+
+### `final_loss`
+
+```rust
+pub fn final_loss(&self) -> Option<f32>
+```
+
+Returns the average loss from the last epoch, or `None` if no epochs ran.
+
+```rust
+if let Some(loss) = history.final_loss() {
+    println!("training complete, final loss: {:.4}", loss);
+}
+```
+
+---
+
+## `EpochStats`
+
+```rust
+#[derive(Clone, Debug)]
+pub struct EpochStats {
+    pub epoch: usize,
+    pub avg_loss: f32,
+    pub steps: usize,
+}
+```
+
+Statistics for a single completed epoch.
+
+<ResponseField name="epoch" type="usize">
+  Zero-based epoch index.
+</ResponseField>
+
+<ResponseField name="avg_loss" type="f32">
+  Average loss across all steps in the epoch.
+</ResponseField>
+
+<ResponseField name="steps" type="usize">
+  Number of batches processed.
+</ResponseField>
+
+---
+
+## `StepMetrics`
+
+```rust
+#[derive(Clone, Debug)]
+pub struct StepMetrics {
+    pub epoch: usize,
+    pub step: usize,
+    pub loss: f32,
+}
+```
+
+Per-step training metrics passed to `MetricCallback::on_step`.
+
+<ResponseField name="epoch" type="usize">Current epoch index.</ResponseField>
+<ResponseField name="step" type="usize">Step index within the epoch.</ResponseField>
+<ResponseField name="loss" type="f32">Loss value for this step.</ResponseField>
+
+---
+
+## `MetricCallback`
+
+```rust
+pub trait MetricCallback {
+    fn on_step(&mut self, _metrics: &StepMetrics) {}
+    fn on_epoch(&mut self, _stats: &EpochStats) {}
+}
+```
+
+A trait for receiving training events. Both methods have default no-op implementations, so you only need to implement what you need.
+
+<ResponseField name="on_step" type="fn(&mut self, metrics: &StepMetrics)">
+  Called after each training step with the step's loss and position.
+</ResponseField>
+
+<ResponseField name="on_epoch" type="fn(&mut self, stats: &EpochStats)">
+  Called at the end of each epoch with the epoch's aggregated statistics.
+</ResponseField>
+
+---
+
+## `LossHistory`
+
+```rust
+#[derive(Default)]
+pub struct LossHistory {
+    pub losses: Vec<f32>,
+}
+```
+
+A `MetricCallback` implementation that records every step's loss for later analysis or plotting.
+
+<ResponseField name="losses" type="Vec<f32>">
+  Ordered list of per-step loss values in the order they were recorded.
+</ResponseField>
+
+`LossHistory` implements `MetricCallback` by appending `metrics.loss` on each `on_step` call.
+
+```rust
+let mut history = LossHistory::default();
+
+// Pass to a custom training loop
+for step in 0..num_steps {
+    session.set_input("x", &batch_data);
+    session.set_learning_rate(lr);
+    session.step();
+    session.wait();
+    let metrics = StepMetrics { epoch: 0, step, loss: session.read_loss() };
+    history.on_step(&metrics);
+}
+
+println!("recorded {} loss values", history.losses.len());
+```

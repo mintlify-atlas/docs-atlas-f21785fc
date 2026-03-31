@@ -1,0 +1,183 @@
+---
+title: "Building computation graphs"
+description: "Learn how to define forward passes, parameters, and inputs using the Graph API."
+keywords: ["graph", "computation graph", "NodeId", "parameters", "inputs", "toposort"]
+---
+
+A `Graph` is Meganeura's representation of your model's forward pass. You build it imperatively by calling methods that append nodes and return `NodeId` handles. When you pass the finished graph to `build_session`, Meganeura runs autodiff, e-graph optimization, and GPU compilation — all from the same declarative description.
+
+## Creating a graph
+
+Call `Graph::new()` to create an empty graph:
+
+```rust
+use meganeura::Graph;
+
+let mut g = Graph::new();
+```
+
+Every subsequent call to `g.input(...)`, `g.parameter(...)`, `g.matmul(...)`, and so on appends a node to the graph and returns a `NodeId`.
+
+## NodeId
+
+`NodeId` is a `u32` alias that acts as a stable handle to a node. You pass it as an argument to any operation that consumes that tensor:
+
+```rust
+let x: NodeId = g.input("x", &[32, 784]);
+let w: NodeId = g.parameter("w1", &[784, 128]);
+let y: NodeId = g.matmul(x, w);  // x and w are consumed here
+```
+
+Nodes are never modified once created. You build a new graph node for each operation.
+
+## Adding inputs
+
+Use `g.input` for floating-point feature tensors and `g.input_u32` for integer token indices:
+
+```rust
+// Float input: batch of 32 images, each 784 pixels
+let x = g.input("x", &[batch, input_dim]);
+
+// Integer input: batch of token IDs for an embedding lookup
+let tokens = g.input_u32("tokens", &[seq_len]);
+```
+
+The name string (`"x"`, `"tokens"`) is what you use later when feeding data to the session:
+
+```rust
+session.set_input("x", &pixel_data);
+```
+
+## Adding parameters
+
+Parameters are learnable weights. The optimizer updates them each step.
+
+```rust
+let w1 = g.parameter("w1", &[784, 128]);
+let b1 = g.parameter("b1", &[128]);
+```
+
+After building the session, you initialize parameters by name:
+
+```rust
+session.set_parameter("w1", &xavier_init(784, 128));
+session.set_parameter("b1", &vec![0.0_f32; 128]);
+```
+
+### HuggingFace naming convention
+
+When loading pretrained weights from safetensors files, Meganeura matches parameter names exactly. Follow the standard HuggingFace naming scheme so weights load automatically:
+
+| Layer type | Parameter name pattern |
+|---|---|
+| Linear weight | `layer_name.weight` |
+| Linear bias | `layer_name.bias` |
+| RmsNorm scale | `layer_name.weight` |
+| Attention Q | `layer_name.self_attn.q_proj.weight` |
+
+The `nn::` layer constructors follow this convention automatically when you pass a `name` matching the checkpoint's key prefix.
+
+## Adding constants
+
+Use `g.constant` for fixed tensors embedded in the graph, and `g.scalar` for single float values:
+
+```rust
+// Constant tensor — data is embedded in the graph
+let c = g.constant(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]);
+
+// Scalar constant — shape [1]
+let scale = g.scalar(0.5_f32);
+```
+
+Constants are never updated during training.
+
+## Setting outputs
+
+Call `g.set_outputs` with the loss node (or any other terminal nodes) before passing the graph to `build_session`:
+
+```rust
+let loss = g.cross_entropy_loss(logits, labels);
+g.set_outputs(vec![loss]);
+```
+
+You must call `set_outputs` before building a session. The autodiff engine traces backward from output nodes to compute gradients.
+
+## Calling toposort before autodiff
+
+The e-graph optimizer can append nodes out of insertion order. Call `toposort()` before running autodiff to ensure every node's inputs have lower IDs than the node itself:
+
+```rust
+let sorted = g.toposort();
+let full_graph = autodiff::differentiate(&sorted);
+```
+
+`build_session` calls this for you internally, but if you are calling `autodiff::differentiate` directly you must sort first.
+
+<Note>
+`toposort()` also strips `Nop` nodes that were marked dead by the optimizer. The returned graph has consecutive IDs with no gaps.
+</Note>
+
+## Full example: two-layer MLP for MNIST
+
+The following is taken directly from `examples/mnist.rs`:
+
+```rust
+use meganeura::{Graph, build_session};
+
+let batch = 32;
+let input_dim = 784;
+let hidden = 128;
+let classes = 10;
+
+let mut g = Graph::new();
+
+// Inputs
+let x = g.input("x", &[batch, input_dim]);
+let labels = g.input("labels", &[batch, classes]);
+
+// Layer 1: linear + relu
+let w1 = g.parameter("w1", &[input_dim, hidden]);
+let b1 = g.parameter("b1", &[hidden]);
+let mm1 = g.matmul(x, w1);
+let h1 = g.bias_add(mm1, b1);
+let a1 = g.relu(h1);
+
+// Layer 2: linear → logits
+let w2 = g.parameter("w2", &[hidden, classes]);
+let b2 = g.parameter("b2", &[classes]);
+let mm2 = g.matmul(a1, w2);
+let logits = g.bias_add(mm2, b2);
+
+// Loss
+let loss = g.cross_entropy_loss(logits, labels);
+g.set_outputs(vec![loss]);
+
+// Compile: autodiff + egglog optimize + GPU init
+let mut session = build_session(&g);
+```
+
+<Steps>
+  <Step title="Define inputs and parameters">
+    Call `g.input` and `g.parameter` to create leaf nodes. Each returns a `NodeId`.
+  </Step>
+  <Step title="Build the forward pass">
+    Chain operations — `matmul`, `bias_add`, `relu` — by passing `NodeId`s as arguments. Each call appends a node and returns its `NodeId`.
+  </Step>
+  <Step title="Attach a loss function">
+    Pass the logits and labels to `g.cross_entropy_loss` (or another loss). The output is a scalar `[1]` node.
+  </Step>
+  <Step title="Set outputs and build">
+    Call `g.set_outputs(vec![loss])`, then pass the graph to `build_session`. Autodiff, optimization, and GPU compilation happen automatically.
+  </Step>
+</Steps>
+
+## Available loss functions
+
+| Method | Description |
+|---|---|
+| `g.cross_entropy_loss(logits, labels)` | Categorical cross-entropy; both inputs `[N, C]`. |
+| `g.bce_loss(pred, labels)` | Binary cross-entropy; `pred` should be in (0, 1). |
+| `g.mse_loss(pred, target)` | Mean squared error: `mean((pred - target)²)`. |
+| `g.l1_loss(pred, target)` | Mean absolute error: `mean(|pred - target|)`. |
+
+All loss functions return a scalar `[1]` node suitable as the single output to `set_outputs`.

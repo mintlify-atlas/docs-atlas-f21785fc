@@ -1,0 +1,750 @@
+---
+title: 'Graph operations'
+description: 'Comprehensive reference for all Graph builder methods: tensor creation, matrix ops, elementwise, activations, reductions, embeddings, and spatial ops.'
+keywords: ['graph', 'matmul', 'relu', 'softmax', 'embedding', 'conv2d', 'concat', 'upsample', 'NodeId']
+---
+
+`Graph` is the central data structure in Meganeura. Every call to a builder method appends a node and returns its `NodeId`. Nodes are identified by a `u32` handle and stored in definition order. The graph can be topologically sorted and compiled to a GPU program.
+
+```rust
+pub type NodeId = u32;
+```
+
+```rust
+let mut g = Graph::new();
+let x = g.input("x", &[4, 784]);
+let w = g.parameter("w", &[784, 128]);
+let y = g.matmul(x, w);
+let h = g.relu(y);
+g.set_outputs(vec![h]);
+```
+
+---
+
+## Tensor creation
+
+### `g.input`
+
+Declares an f32 runtime input (e.g. data or activations passed at inference time).
+
+<ParamField path="name" type="&str" required>
+  Unique name used to bind values at runtime.
+</ParamField>
+
+<ParamField path="shape" type="&[usize]" required>
+  Tensor shape.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Node of type `f32` with the given shape.
+</ResponseField>
+
+```rust
+let x = g.input("x", &[4, 784]);
+```
+
+### `g.input_u32`
+
+Declares a U32 runtime input. Required for token indices, position counters, and other integer data.
+
+<ParamField path="name" type="&str" required>
+  Unique name used to bind values at runtime.
+</ParamField>
+
+<ParamField path="shape" type="&[usize]" required>
+  Tensor shape.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Node of type `u32` with the given shape.
+</ResponseField>
+
+```rust
+let tokens = g.input_u32("tokens", &[seq_len]);
+let kv_pos = g.input_u32("kv_pos", &[1]);
+```
+
+### `g.parameter`
+
+Declares a learnable f32 parameter (weight or bias). Parameters are loaded from a checkpoint and updated by the optimizer.
+
+<ParamField path="name" type="&str" required>
+  Unique name used to look up the parameter in the weight file.
+</ParamField>
+
+<ParamField path="shape" type="&[usize]" required>
+  Parameter shape.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Node of type `f32` with the given shape.
+</ResponseField>
+
+```rust
+let w = g.parameter("fc.weight", &[784, 128]);
+let b = g.parameter("fc.bias", &[128]);
+```
+
+### `g.constant`
+
+Embeds a fixed f32 tensor whose values are known at graph construction time.
+
+<ParamField path="data" type="Vec<f32>" required>
+  Flat data buffer. Length must equal the product of all `shape` dimensions.
+</ParamField>
+
+<ParamField path="shape" type="&[usize]" required>
+  Tensor shape.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Node holding the constant values.
+</ResponseField>
+
+```rust
+let c = g.constant(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]);
+```
+
+### `g.scalar`
+
+Convenience wrapper that creates a constant with shape `[1]`.
+
+<ParamField path="value" type="f32" required>
+  The scalar value.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Shape `[1]` constant node.
+</ResponseField>
+
+```rust
+let one = g.scalar(1.0);
+```
+
+---
+
+## Matrix operations
+
+All matrix ops require 2D tensors.
+
+### `g.matmul`
+
+Standard matrix multiply: `C = A @ B`.
+
+<ParamField path="a" type="NodeId" required>
+  Shape `[M, K]`.
+</ParamField>
+
+<ParamField path="b" type="NodeId" required>
+  Shape `[K, N]`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Shape `[M, N]`.
+</ResponseField>
+
+```rust
+let y = g.matmul(x, w);  // [M,K] @ [K,N] → [M,N]
+```
+
+### `g.matmul_at`
+
+Transposed-A matrix multiply: `C = A^T @ B`.
+
+A is stored as `[K, M]` (i.e. the transpose is implicit — no actual transpose is performed).
+
+<ParamField path="a" type="NodeId" required>
+  Shape `[K, M]` (stored transposed).
+</ParamField>
+
+<ParamField path="b" type="NodeId" required>
+  Shape `[K, N]`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Shape `[M, N]`.
+</ResponseField>
+
+```rust
+// Gradient accumulation: grad_w = x^T @ grad_y
+let grad_w = g.matmul_at(x, grad_y);  // [K,M]^T @ [K,N] → [M,N]
+```
+
+### `g.matmul_bt`
+
+Transposed-B matrix multiply: `C = A @ B^T`.
+
+B is stored as `[N, K]` (transposed layout).
+
+<ParamField path="a" type="NodeId" required>
+  Shape `[M, K]`.
+</ParamField>
+
+<ParamField path="b" type="NodeId" required>
+  Shape `[N, K]` (stored transposed).
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Shape `[M, N]`.
+</ResponseField>
+
+```rust
+// Attention scores: Q @ K^T
+let scores = g.matmul_bt(q, k);  // [M,K] @ [N,K]^T → [M,N]
+```
+
+---
+
+## Elementwise ops
+
+### `g.add`
+
+Element-wise addition. Both inputs must have the same shape.
+
+<ParamField path="a" type="NodeId" required>
+  Shape `[...]`.
+</ParamField>
+
+<ParamField path="b" type="NodeId" required>
+  Same shape as `a`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Same shape as inputs.
+</ResponseField>
+
+```rust
+let out = g.add(x, residual);
+```
+
+### `g.mul`
+
+Element-wise multiplication. Both inputs must have the same shape.
+
+<ParamField path="a" type="NodeId" required>
+  Shape `[...]`.
+</ParamField>
+
+<ParamField path="b" type="NodeId" required>
+  Same shape as `a`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Same shape as inputs.
+</ResponseField>
+
+```rust
+let gated = g.mul(gate, up);
+```
+
+### `g.bias_add`
+
+Adds a 1D bias to each row of a 2D tensor: `out[i, j] = a[i, j] + bias[j]`.
+
+<ParamField path="a" type="NodeId" required>
+  2D tensor of shape `[M, N]`.
+</ParamField>
+
+<ParamField path="bias" type="NodeId" required>
+  1D bias of shape `[N]`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Shape `[M, N]`.
+</ResponseField>
+
+```rust
+let out = g.bias_add(mm, b);
+```
+
+### `g.broadcast_add`
+
+Adds a `[1, N]` tensor to every row of a `[M, N]` tensor. Uses the same `BiasAdd` shader as `bias_add`.
+
+<ParamField path="a" type="NodeId" required>
+  2D tensor of shape `[M, N]`.
+</ParamField>
+
+<ParamField path="b" type="NodeId" required>
+  2D tensor of shape `[1, N]`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Shape `[M, N]`.
+</ResponseField>
+
+```rust
+let out = g.broadcast_add(x, pos_bias);  // pos_bias shape: [1, N]
+```
+
+### `g.greater`
+
+Element-wise greater-than comparison for use in autodiff (e.g. ReLU gradient). Both inputs must have the same shape.
+
+<ParamField path="a" type="NodeId" required>
+  Shape `[...]`.
+</ParamField>
+
+<ParamField path="b" type="NodeId" required>
+  Same shape as `a`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Same shape. Values are `1.0` where `a > b`, `0.0` otherwise.
+</ResponseField>
+
+### `g.neg`
+
+Element-wise negation: `out = -x`.
+
+<ParamField path="x" type="NodeId" required>
+  Any shape.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Same shape.
+</ResponseField>
+
+### `g.abs`
+
+Element-wise absolute value: `out = |x|`.
+
+<ParamField path="x" type="NodeId" required>
+  Any shape.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Same shape.
+</ResponseField>
+
+### `g.log`
+
+Element-wise natural logarithm: `out = ln(x)`.
+
+<ParamField path="x" type="NodeId" required>
+  Any shape.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Same shape.
+</ResponseField>
+
+### `g.recip`
+
+Element-wise reciprocal: `out = 1 / x`.
+
+<ParamField path="x" type="NodeId" required>
+  Any shape.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Same shape.
+</ResponseField>
+
+### `g.div`
+
+Element-wise division: `out = a / b`. Implemented as `a * recip(b)`.
+
+<ParamField path="a" type="NodeId" required>
+  Any shape.
+</ParamField>
+
+<ParamField path="b" type="NodeId" required>
+  Same shape as `a`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Same shape.
+</ResponseField>
+
+---
+
+## Activations
+
+### `g.relu`
+
+Rectified linear unit: `out = max(0, x)`.
+
+<ParamField path="x" type="NodeId" required>
+  Any shape.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Same shape.
+</ResponseField>
+
+### `g.sigmoid`
+
+Logistic sigmoid: `out = 1 / (1 + exp(-x))`.
+
+<ParamField path="x" type="NodeId" required>
+  Any shape.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Same shape.
+</ResponseField>
+
+### `g.silu`
+
+Sigmoid linear unit: `out = x * sigmoid(x)`.
+
+<ParamField path="x" type="NodeId" required>
+  Any shape.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Same shape.
+</ResponseField>
+
+### `g.gelu`
+
+Gaussian error linear unit: `out = x * 0.5 * (1 + erf(x / sqrt(2)))`.
+
+<ParamField path="x" type="NodeId" required>
+  Any shape.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Same shape.
+</ResponseField>
+
+### `g.swiglu`
+
+Fused SwiGLU: `out = silu(gate) * up`. Both inputs must have the same shape.
+
+<ParamField path="gate" type="NodeId" required>
+  Gate tensor of shape `[M, N]`.
+</ParamField>
+
+<ParamField path="up" type="NodeId" required>
+  Up tensor of shape `[M, N]`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Shape `[M, N]`.
+</ResponseField>
+
+```rust
+let gate = gate_proj.forward(&mut g, x);
+let up = up_proj.forward(&mut g, x);
+let h = g.swiglu(gate, up);
+```
+
+### `g.swiglu_concat`
+
+SwiGLU on a concatenated input of shape `[M, 2*N]`. Reads gate from the first half and up from the second half.
+
+<ParamField path="input" type="NodeId" required>
+  2D tensor of shape `[M, 2*N]`. The last dimension must be even.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Shape `[M, N]`.
+</ResponseField>
+
+```rust
+let h = g.swiglu_concat(fused_proj_output);  // [M, 2*N] → [M, N]
+```
+
+---
+
+## Reductions
+
+### `g.sum_all`
+
+Sums all elements to a scalar.
+
+<ParamField path="x" type="NodeId" required>
+  Any shape.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Shape `[1]`.
+</ResponseField>
+
+### `g.mean_all`
+
+Averages all elements to a scalar.
+
+<ParamField path="x" type="NodeId" required>
+  Any shape.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Shape `[1]`.
+</ResponseField>
+
+### `g.softmax`
+
+Row-wise softmax for 2D inputs.
+
+<ParamField path="x" type="NodeId" required>
+  Any shape (row-wise for 2D).
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Same shape.
+</ResponseField>
+
+### `g.log_softmax`
+
+Numerically stable log-softmax (row-wise for 2D inputs).
+
+<ParamField path="x" type="NodeId" required>
+  Any shape.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Same shape.
+</ResponseField>
+
+### `g.transpose`
+
+Swaps the two dimensions of a 2D tensor: `[M, N] → [N, M]`.
+
+<ParamField path="x" type="NodeId" required>
+  2D tensor of shape `[M, N]`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Shape `[N, M]`.
+</ResponseField>
+
+```rust
+let xt = g.transpose(x);  // [4, 8] → [8, 4]
+```
+
+---
+
+## Embedding ops
+
+### `g.embedding`
+
+Looks up rows from an embedding table.
+
+<ParamField path="indices" type="NodeId" required>
+  1D U32 tensor of shape `[seq_len]`.
+</ParamField>
+
+<ParamField path="table" type="NodeId" required>
+  2D f32 parameter of shape `[vocab_size, embed_dim]`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Shape `[seq_len, embed_dim]`.
+</ResponseField>
+
+```rust
+let indices = g.input_u32("tokens", &[seq_len]);
+let table = g.parameter("embed", &[32000, 512]);
+let embeds = g.embedding(indices, table);
+// embeds shape: [seq_len, 512]
+```
+
+### `g.scatter_add`
+
+Accumulates source rows into an output tensor indexed by `indices`. The backward of `embedding`.
+
+<ParamField path="indices" type="NodeId" required>
+  1D U32 tensor of shape `[seq_len]`.
+</ParamField>
+
+<ParamField path="src" type="NodeId" required>
+  2D f32 tensor of shape `[seq_len, embed_dim]`.
+</ParamField>
+
+<ParamField path="vocab_size" type="usize" required>
+  Number of rows in the output accumulator.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Shape `[vocab_size, embed_dim]` where `output[indices[i]] += src[i]`.
+</ResponseField>
+
+---
+
+## Spatial ops
+
+All spatial ops work on tensors stored as flat 1D arrays in NCHW order.
+
+### `g.conv2d`
+
+2D convolution: `input[N, C_in, H, W] * kernel[C_out, C_in, kH, kW] → output[N, C_out, oH, oW]`.
+
+<ParamField path="input" type="NodeId" required>
+  Flat tensor of size `N * C_in * H * W`.
+</ParamField>
+
+<ParamField path="kernel" type="NodeId" required>
+  Flat kernel of size `C_out * C_in * kH * kW`.
+</ParamField>
+
+<ParamField path="batch" type="u32" required>
+  Batch size `N`.
+</ParamField>
+
+<ParamField path="in_channels" type="u32" required>
+  Input channels `C_in`.
+</ParamField>
+
+<ParamField path="in_h" type="u32" required>
+  Input height `H`.
+</ParamField>
+
+<ParamField path="in_w" type="u32" required>
+  Input width `W`.
+</ParamField>
+
+<ParamField path="out_channels" type="u32" required>
+  Output channels `C_out`.
+</ParamField>
+
+<ParamField path="kernel_h" type="u32" required>
+  Kernel height `kH`.
+</ParamField>
+
+<ParamField path="kernel_w" type="u32" required>
+  Kernel width `kW`.
+</ParamField>
+
+<ParamField path="stride" type="u32" required>
+  Convolution stride.
+</ParamField>
+
+<ParamField path="padding" type="u32" required>
+  Zero-padding on each edge.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Flat tensor of size `N * C_out * oH * oW`, where `oH = (H + 2*padding - kH) / stride + 1`.
+</ResponseField>
+
+```rust
+let y = g.conv2d(x, kernel, 4, 3, 224, 224, 64, 3, 3, 1, 1);
+```
+
+### `g.concat`
+
+Concatenates two flat NCHW tensors along the channel dimension: `[N, Ca, H, W] ++ [N, Cb, H, W] → [N, Ca+Cb, H, W]`.
+
+<ParamField path="a" type="NodeId" required>
+  Flat tensor of size `N * Ca * H * W`.
+</ParamField>
+
+<ParamField path="b" type="NodeId" required>
+  Flat tensor of size `N * Cb * H * W`.
+</ParamField>
+
+<ParamField path="batch" type="u32" required>
+  Batch size `N`.
+</ParamField>
+
+<ParamField path="channels_a" type="u32" required>
+  Number of channels in `a`.
+</ParamField>
+
+<ParamField path="channels_b" type="u32" required>
+  Number of channels in `b`.
+</ParamField>
+
+<ParamField path="spatial" type="u32" required>
+  Spatial size `H * W`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Flat tensor of size `N * (Ca + Cb) * H * W`.
+</ResponseField>
+
+```rust
+let merged = g.concat(skip, x, batch, 32, 64, h * w);
+```
+
+### `g.split_a`
+
+Extracts the first `channels_a` channels from a concatenated `[N, Ca+Cb, H, W]` tensor.
+
+<ParamField path="x" type="NodeId" required>
+  Flat tensor of size `N * (Ca + Cb) * H * W`.
+</ParamField>
+
+<ParamField path="batch" type="u32" required>
+  Batch size `N`.
+</ParamField>
+
+<ParamField path="channels_a" type="u32" required>
+  Channels to extract (first `Ca`).
+</ParamField>
+
+<ParamField path="channels_b" type="u32" required>
+  Remaining channels `Cb`.
+</ParamField>
+
+<ParamField path="spatial" type="u32" required>
+  Spatial size `H * W`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Flat tensor of size `N * Ca * H * W`.
+</ResponseField>
+
+### `g.split_b`
+
+Extracts the last `channels_b` channels from a concatenated `[N, Ca+Cb, H, W]` tensor.
+
+<ParamField path="x" type="NodeId" required>
+  Flat tensor of size `N * (Ca + Cb) * H * W`.
+</ParamField>
+
+<ParamField path="batch" type="u32" required>
+  Batch size `N`.
+</ParamField>
+
+<ParamField path="channels_a" type="u32" required>
+  Leading channels `Ca`.
+</ParamField>
+
+<ParamField path="channels_b" type="u32" required>
+  Channels to extract (last `Cb`).
+</ParamField>
+
+<ParamField path="spatial" type="u32" required>
+  Spatial size `H * W`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Flat tensor of size `N * Cb * H * W`.
+</ResponseField>
+
+### `g.upsample_2x`
+
+Nearest-neighbor 2× upsampling: `[N, C, H, W] → [N, C, 2H, 2W]`.
+
+<ParamField path="x" type="NodeId" required>
+  Flat input tensor of size `N * C * H * W`.
+</ParamField>
+
+<ParamField path="batch" type="u32" required>
+  Batch size `N`.
+</ParamField>
+
+<ParamField path="channels" type="u32" required>
+  Number of channels `C`.
+</ParamField>
+
+<ParamField path="in_h" type="u32" required>
+  Input height `H`.
+</ParamField>
+
+<ParamField path="in_w" type="u32" required>
+  Input width `W`.
+</ParamField>
+
+<ResponseField name="NodeId" type="NodeId">
+  Flat tensor of size `N * C * (2H) * (2W)`.
+</ResponseField>
+
+```rust
+let up = g.upsample_2x(x, batch, 128, 16, 16);
+// up size: N * 128 * 32 * 32
+```

@@ -1,0 +1,151 @@
+---
+title: "SmolVLM2"
+description: "Vision-language model combining a SigLIP vision encoder with a LLaMA-3 text decoder."
+---
+
+SmolVLM2 is a compact vision-language model. It processes image patches through a SigLIP-style vision transformer, then projects the resulting features into the text model's embedding space via a pixel shuffle connector and cross-attention layers in the text decoder.
+
+## Configuration
+
+SmolVLM2 uses two separate configs — one for the vision encoder and one for the text decoder — wrapped in `SmolVLM2Config`.
+
+### VisionConfig
+
+<ParamField path="image_size" type="usize">
+  Input image size in pixels (square). SmolVLM2-500M uses `512`.
+</ParamField>
+
+<ParamField path="patch_size" type="usize">
+  Patch size in pixels (square). SmolVLM2-500M uses `16`, giving 32×32 = 1024 patches.
+</ParamField>
+
+<ParamField path="hidden_size" type="usize">
+  Hidden dimensionality of the vision transformer. SmolVLM2-500M uses `768`.
+</ParamField>
+
+<ParamField path="num_attention_heads" type="u32">
+  Number of attention heads in the vision transformer. SmolVLM2-500M uses `12`.
+</ParamField>
+
+<ParamField path="num_hidden_layers" type="usize">
+  Number of vision transformer layers. SmolVLM2-500M uses `12`.
+</ParamField>
+
+<ParamField path="intermediate_size" type="usize">
+  Vision MLP intermediate size. SmolVLM2-500M uses `3072` (4× hidden).
+</ParamField>
+
+<ParamField path="layer_norm_eps" type="f32">
+  Layer norm epsilon. SmolVLM2-500M uses `1e-6`.
+</ParamField>
+
+### TextConfig
+
+<ParamField path="vocab_size" type="usize">
+  Vocabulary size. SmolVLM2-500M uses `49280`.
+</ParamField>
+
+<ParamField path="hidden_size" type="usize">
+  Text decoder hidden dimensionality. SmolVLM2-500M uses `960`.
+</ParamField>
+
+<ParamField path="num_hidden_layers" type="usize">
+  Number of text decoder layers. SmolVLM2-500M uses `32`.
+</ParamField>
+
+<ParamField path="num_attention_heads" type="u32">
+  Number of query heads in GQA. SmolVLM2-500M uses `15`.
+</ParamField>
+
+<ParamField path="num_key_value_heads" type="u32">
+  Number of KV heads. SmolVLM2-500M uses `5`.
+</ParamField>
+
+<ParamField path="intermediate_size" type="usize">
+  SwiGLU FFN intermediate size. SmolVLM2-500M uses `2560`.
+</ParamField>
+
+<ParamField path="rms_norm_eps" type="f32">
+  RMSNorm epsilon. SmolVLM2-500M uses `1e-5`.
+</ParamField>
+
+<ParamField path="rope_theta" type="f32">
+  RoPE base frequency. SmolVLM2-500M uses `100000.0`.
+</ParamField>
+
+### SmolVLM2Config
+
+<ParamField path="vision" type="VisionConfig">
+  Vision encoder configuration.
+</ParamField>
+
+<ParamField path="text" type="TextConfig">
+  Text decoder configuration.
+</ParamField>
+
+<ParamField path="scale_factor" type="usize">
+  Pixel shuffle scale factor for spatial downsampling before the connector projection. SmolVLM2-500M uses `2`.
+</ParamField>
+
+Use the built-in preset:
+
+```rust
+use meganeura::models::smolvlm2::{SmolVLM2Config, build_graph};
+
+let config = SmolVLM2Config::smolvlm2_500m();
+```
+
+## Architecture
+
+<Steps>
+  <Step title="Vision encoder (SigLIP ViT)">
+    The image is divided into `patch_size × patch_size` patches. Each patch is linearly projected into the vision hidden space. A standard transformer encoder (LayerNorm + full attention + LayerNorm + MLP) processes all patches in parallel.
+  </Step>
+  <Step title="Pixel shuffle connector">
+    Vision features are spatially downsampled by `scale_factor` via pixel shuffle, then projected into the text decoder's embedding dimension with a linear layer.
+  </Step>
+  <Step title="Text decoder with cross-attention">
+    The text decoder uses LLaMA-3 style transformer blocks. Image-conditioned layers include cross-attention over the projected vision features in addition to causal self-attention over the text tokens.
+  </Step>
+</Steps>
+
+## Building the graph
+
+```rust
+use meganeura::{Graph, build_inference_session};
+use meganeura::models::smolvlm2::{SmolVLM2Config, build_graph};
+
+let config = SmolVLM2Config::smolvlm2_500m();
+let text_seq_len = 128;
+
+let mut g = Graph::new();
+let logits = build_graph(&mut g, &config, text_seq_len);
+g.set_outputs(vec![logits]);
+
+let session = build_inference_session(&g);
+```
+
+The graph expects the following inputs:
+
+- `"image_patches"` — F32 tensor of shape `[num_patches, patch_dim]` where `num_patches = (image_size/patch_size)²` and `patch_dim = 3 * patch_size²`
+- `"vision_features_shuffled"` — F32 tensor of shape `[num_vision_tokens, connector_input_dim]` — pixel-shuffled vision features after preprocessing
+- `"combined_embeds"` — F32 tensor of shape `[num_vision_tokens + text_seq_len, hidden_size]` — concatenated vision and text embeddings
+- `"token_ids"` — U32 tensor of shape `[text_seq_len]`
+
+You can also call `build_vision_encoder(&mut g, &config.vision, num_patches)` separately to build just the vision encoder subgraph.
+
+## Key parameter names
+
+Vision encoder parameters follow the pattern:
+
+```
+model.vision_model.encoder.layers.{i}.self_attn.q_proj.weight
+model.vision_model.encoder.layers.{i}.layer_norm1.weight
+model.vision_model.encoder.layers.{i}.mlp.fc1.weight
+```
+
+Text decoder parameters mirror the SmolLM2 naming under `model.text_model.layers.{i}`.
+
+<Tip>
+Use `examples/smolvlm2.rs` in the repository for a complete weight-loading and inference walkthrough including image preprocessing.
+</Tip>

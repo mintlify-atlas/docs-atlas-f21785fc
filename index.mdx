@@ -1,97 +1,105 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Meganeura"
+description: "Cross-platform GPU-accelerated neural network training and inference in Rust, powered by e-graph optimization and blade-graphics."
 ---
 
-## Setting up
+Meganeura is a Rust library for training and running neural networks on any GPU — from laptops to edge devices — without CUDA dependencies. Models are defined as declarative computation graphs, automatically differentiated, e-graph optimized, and compiled to static GPU dispatch sequences with zero JIT warmup.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Train your first model in minutes with a working MNIST example.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="System Requirements" icon="microchip" href="/system-requirements">
+    Supported GPUs, drivers, and platforms for Vulkan and Metal backends.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Concepts" icon="brain" href="/concepts/computation-graph">
+    Learn how computation graphs, e-graph optimization, and autodiff work together.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/graph">
+    Full reference for Graph, Session, Trainer, and all neural network layers.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Why Meganeura?
 
-Everything you need to create world-class documentation.
+<CardGroup cols={3}>
+  <Card title="Portable" icon="globe">
+    Runs on Linux, Windows, macOS, iOS, and Android via Vulkan and Metal — no CUDA required.
+  </Card>
+  <Card title="Zero compile time" icon="bolt">
+    No JIT warmup. The execution plan is compiled once at graph build time and runs instantly.
+  </Card>
+  <Card title="E-graph optimized" icon="diagram-project">
+    Equality saturation via egglog automatically fuses kernels like SwiGLU, MatMul+Add, and RmsNorm.
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Get started
 
-## Need inspiration?
+<Steps>
+  <Step title="Add Meganeura to your project">
+    Add the dependency to your `Cargo.toml`:
+    ```toml Cargo.toml
+    [dependencies]
+    meganeura = { git = "https://github.com/kvark/meganeura" }
+    ```
+  </Step>
+  <Step title="Define a computation graph">
+    Build your model as a declarative graph of operations:
+    ```rust
+    use meganeura::Graph;
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+    let mut g = Graph::new();
+    let x = g.input("x", &[32, 784]);
+    let labels = g.input("labels", &[32, 10]);
+
+    let w1 = g.parameter("w1", &[784, 128]);
+    let b1 = g.parameter("b1", &[128]);
+    let h = g.bias_add(g.matmul(x, w1), b1);
+    let h = g.relu(h);
+
+    let w2 = g.parameter("w2", &[128, 10]);
+    let logits = g.matmul(h, w2);
+    let loss = g.cross_entropy_loss(logits, labels);
+    g.set_outputs(vec![loss]);
+    ```
+  </Step>
+  <Step title="Build a training session">
+    Meganeura runs autodiff, e-graph optimization, and GPU compilation automatically:
+    ```rust
+    use meganeura::build_session;
+
+    let mut session = build_session(&g);
+    ```
+  </Step>
+  <Step title="Train your model">
+    Use the `Trainer` to run the training loop:
+    ```rust
+    use meganeura::{TrainConfig, Trainer};
+
+    let config = TrainConfig { learning_rate: 0.01, ..Default::default() };
+    let mut trainer = Trainer::new(session, config);
+    let history = trainer.train(&mut loader, 10);
+    println!("final loss: {:.4}", history.final_loss().unwrap());
+    ```
+  </Step>
+</Steps>
+
+## Built-in model support
+
+Meganeura ships with pre-built graph definitions for popular architectures. Load HuggingFace weights directly and run inference immediately.
+
+<CardGroup cols={2}>
+  <Card title="SmolLM2" icon="comment" href="/models/smollm2">
+    Decoder-only language model with GQA, RoPE, and SwiGLU FFN.
+  </Card>
+  <Card title="SmolVLM2" icon="image" href="/models/smolvlm2">
+    Vision-language model with cross-attention between image and text tokens.
+  </Card>
+  <Card title="Stable Diffusion UNet" icon="paintbrush" href="/models/stable-diffusion">
+    Diffusion model UNet with Conv2d, GroupNorm, and cross-attention.
+  </Card>
+  <Card title="HuggingFace Integration" icon="download" href="/inference/huggingface-integration">
+    Load safetensors weights from any HuggingFace Hub repository.
+  </Card>
+</CardGroup>

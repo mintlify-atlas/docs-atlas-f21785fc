@@ -1,0 +1,187 @@
+---
+title: "Computation graph"
+description: "How Meganeura represents neural networks as static, typed dataflow graphs before compiling them to GPU dispatch sequences."
+keywords: ["computation graph", "graph", "NodeId", "TensorType", "DType", "ops", "toposort"]
+---
+
+A `Graph` is the central data structure in Meganeura. You describe your model by creating nodes and edges in a `Graph`, then pass the graph through the optimization and compilation pipeline. No computation happens while you build the graph — it is a pure description of operations and data dependencies.
+
+## Nodes, edges, and NodeId
+
+Every operation in the graph produces a single output node. `NodeId` is a `u32` that uniquely identifies a node within a graph:
+
+```rust
+pub type NodeId = u32;
+```
+
+When you call a builder method such as `g.matmul(a, b)`, the graph appends a new `Node` and returns its `NodeId`. You use that id as an input to subsequent operations:
+
+```rust
+pub struct Node {
+    pub id: NodeId,
+    pub op: Op,
+    pub inputs: Vec<NodeId>,
+    pub ty: TensorType,
+}
+```
+
+Edges are implicit: a node's `inputs` field references the `NodeId`s of the nodes it consumes.
+
+## Leaf nodes: Input, Parameter, and Constant
+
+Three node types carry data into the graph without consuming other nodes.
+
+| Kind | Op variant | Purpose |
+|------|-----------|---------|
+| `Input` | `Op::Input { name }` | Runtime data uploaded each step (e.g. a batch of images) |
+| `Parameter` | `Op::Parameter { name }` | Trainable weights — persisted across steps |
+| `Constant` | `Op::Constant { data }` | Fixed values baked into the graph (e.g. scale factors) |
+
+You create them with the corresponding builder methods:
+
+```rust
+let x  = g.input("x", &[batch, 784]);         // Op::Input
+let w1 = g.parameter("w1", &[784, 128]);       // Op::Parameter
+let b1 = g.parameter("b1", &[128]);            // Op::Parameter
+let c  = g.constant(vec![0.0; 128], &[128]);   // Op::Constant
+```
+
+A `scalar` is a convenience wrapper for a single-element constant:
+
+```rust
+pub fn scalar(&mut self, value: f32) -> NodeId {
+    self.constant(vec![value], &[1])
+}
+```
+
+## TensorType and DType
+
+Every node carries a `TensorType` that describes the shape and element type of its output tensor:
+
+```rust
+pub struct TensorType {
+    pub shape: Vec<usize>,
+    pub dtype: DType,
+}
+
+pub enum DType {
+    F32,
+    U32,
+}
+```
+
+You rarely construct `TensorType` directly — builder methods infer the output type from their inputs. Utilities like `num_elements()` and `size_bytes()` let you inspect memory usage:
+
+```rust
+let t = TensorType::f32(vec![32, 784]);
+assert_eq!(t.num_elements(), 32 * 784);
+assert_eq!(t.size_bytes(), 32 * 784 * 4);
+```
+
+Most tensors use `DType::F32`. `DType::U32` is used for integer inputs such as token IDs passed to `embedding`.
+
+## Op variants
+
+`Op` is an exhaustive enum that covers every operation the compiler knows how to lower to a GPU shader. The variants fall into several families:
+
+<AccordionGroup>
+  <Accordion title="Matrix multiplication">
+    `MatMul`, `MatMulAT` (A transposed), `MatMulBT` (B transposed), and their fused counterparts `FusedMatMulAdd`, `FusedMatMulATAdd`, `FusedMatMulBTAdd`. The fused variants are produced by the optimizer — you never create them by hand.
+  </Accordion>
+  <Accordion title="Element-wise binary">
+    `Add`, `Mul`, `BiasAdd` (broadcasts a 1-D bias over a 2-D tensor), `Greater`.
+  </Accordion>
+  <Accordion title="Element-wise unary">
+    `Relu`, `Sigmoid`, `Neg`, `Abs`, `Log`, `Recip`, `Silu`, `Gelu`.
+  </Accordion>
+  <Accordion title="Reductions">
+    `SumAll` and `MeanAll` reduce to a scalar `[1]` tensor. `SumRows` reduces `[M, N]` to `[N]`. `Softmax` and `LogSoftmax` operate row-wise.
+  </Accordion>
+  <Accordion title="Loss functions">
+    `CrossEntropyLoss`, `BceLoss`.
+  </Accordion>
+  <Accordion title="Transformer ops">
+    `RmsNorm`, `LayerNorm`, `SwiGLU`, `SwiGLUConcat`, `CausalAttention`, `FullAttention`, `CrossAttention`, `MultiHeadAttn`, `RoPE`, `Embedding`.
+  </Accordion>
+  <Accordion title="Backward / gradient ops">
+    `RmsNormGradW`, `RmsNormGradX`, `SwiGLUGradGate`, `SwiGLUGradUp`, `SiluGrad`, `MultiHeadAttnGradQ/K/V`. These are inserted automatically by `differentiate()` — you do not create them yourself.
+  </Accordion>
+  <Accordion title="Vision / CNN ops">
+    `Conv2d`, `GroupNorm`, `GroupNormSilu`, `Concat`, `SplitA`, `SplitB`, `Upsample2x`.
+  </Accordion>
+  <Accordion title="KV cache ops">
+    `CacheWrite`, `CachedAttention`. Inference-only; do not appear in training graphs.
+  </Accordion>
+</AccordionGroup>
+
+## Building a 2-layer MLP graph
+
+The following example constructs a complete 2-layer MLP forward graph with cross-entropy loss. The pattern — input, parameter, matmul, bias, activation, repeat — is the same for any depth:
+
+```rust
+use meganeura::Graph;
+
+let batch = 4;
+let mut g = Graph::new();
+
+// Inputs
+let x      = g.input("x",      &[batch, 784]);
+let labels = g.input("labels", &[batch, 10]);
+
+// Layer 1: linear + ReLU
+let w1 = g.parameter("w1", &[784, 128]);
+let b1 = g.parameter("b1", &[128]);
+let h1 = g.matmul(x, w1);          // [4, 784] @ [784, 128] → [4, 128]
+let h1 = g.bias_add(h1, b1);       // [4, 128] + [128] → [4, 128]
+let h1 = g.relu(h1);               // [4, 128]
+
+// Layer 2: linear
+let w2 = g.parameter("w2", &[128, 10]);
+let logits = g.matmul(h1, w2);     // [4, 128] @ [128, 10] → [4, 10]
+
+// Loss
+let loss = g.cross_entropy_loss(logits, labels);  // → [1]
+
+// Mark the output
+g.set_outputs(vec![loss]);
+```
+
+<Note>
+  Shape assertions fire immediately during graph construction. If you pass incompatible shapes to `matmul`, `add`, or any other op, the process panics with a descriptive message before any GPU work is attempted.
+</Note>
+
+## set_outputs()
+
+You must call `set_outputs()` before passing the graph to any pipeline function. The output list tells the compiler which nodes' buffers must be readable on the host (e.g. the loss scalar) and drives the backward pass: `differentiate()` starts from `outputs()[0]` as the loss node.
+
+```rust
+g.set_outputs(vec![loss]);
+```
+
+For training, the first output must be the scalar loss. For inference, it is the model's prediction tensor. You can list multiple outputs — for example, to read back intermediate activations or KV cache buffers after a prefill step.
+
+## toposort()
+
+The optimizer may append new nodes at the end of the node list to satisfy fusions (for example, a merged weight parameter for `SwiGLUConcat`). The resulting graph is no longer in strict dependency order. Call `toposort()` before running autodiff to ensure that every node appears after all its inputs:
+
+```rust
+let sorted = optimized_graph.toposort();
+let full = meganeura::autodiff::differentiate(&sorted);
+```
+
+Internally, `toposort()` uses Kahn's algorithm to produce a new graph with consecutive, dependency-ordered IDs, and it removes any `Nop` nodes left behind by fusion.
+
+<Tip>
+  `build_session()` and `build_session_with_report()` call `toposort()` for you. You only need to call it directly if you are driving the pipeline manually.
+</Tip>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="E-graph optimization" icon="circle-nodes" href="/concepts/egraph-optimization">
+    How Meganeura fuses ops using equality saturation before compiling.
+  </Card>
+  <Card title="Automatic differentiation" icon="arrows-split-up-and-left" href="/concepts/autodiff">
+    How `differentiate()` appends a backward pass to your forward graph.
+  </Card>
+</CardGroup>

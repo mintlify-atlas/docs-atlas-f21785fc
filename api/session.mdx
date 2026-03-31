@@ -1,0 +1,384 @@
+---
+title: "Session"
+description: "The compiled GPU session — holds all GPU resources and runs the execution plan."
+---
+
+A `Session` is the runtime object produced after compiling a `Graph`. It owns the GPU context, allocates all buffers, compiles GPU pipelines, and executes the pre-built dispatch sequence on each call to `step()` or `run()`.
+
+You do not construct a `Session` directly. Use one of the builder functions:
+
+```rust
+use meganeura::{Graph, build_session, build_inference_session};
+
+// Training session (forward + backward + parameter updates)
+let session = build_session(&graph);
+
+// Inference session (forward pass only)
+let session = build_inference_session(&graph);
+```
+
+---
+
+## Builder functions
+
+### `build_session`
+
+```rust
+pub fn build_session(forward_graph: &Graph) -> Session
+```
+
+Builds a full training session from a forward-pass graph. The pipeline:
+
+1. Optimizes the forward graph (SwiGLU fusion, MatMul+Add fusion, etc.)
+2. Runs autodiff on the optimized forward graph to produce the full forward+backward graph
+3. Optimizes the full graph (fuses backward MatMul+Add, etc.)
+4. Compiles the optimized graph to an `ExecutionPlan`
+5. Allocates all GPU buffers and compiles GPU pipelines
+
+```rust
+let session = build_session(&g);
+```
+
+---
+
+### `build_inference_session`
+
+```rust
+pub fn build_inference_session(forward_graph: &Graph) -> Session
+```
+
+Builds an inference-only session. Skips autodiff — no gradient buffers are allocated. Applies inference-specific fusions (e.g. `GroupNorm + SiLU → GroupNormSilu`).
+
+```rust
+let session = build_inference_session(&g);
+```
+
+---
+
+### `build_session_cached`
+
+```rust
+pub fn build_session_cached(forward_graph: &Graph, cache_path: &Path) -> Session
+```
+
+Like `build_session`, but loads the compiled `ExecutionPlan` from a cache file if the graph hash matches. Saves the plan after compilation if no cache exists. Useful for skipping the compilation overhead on repeated runs.
+
+<ParamField path="forward_graph" type="&Graph" required>The forward-pass computation graph.</ParamField>
+<ParamField path="cache_path" type="&Path" required>Path to read from / write to (e.g. `"model.plan.ron"`).</ParamField>
+
+---
+
+### `build_session_with_report`
+
+```rust
+pub fn build_session_with_report(forward_graph: &Graph) -> (Session, OptimizeReport)
+```
+
+Like `build_session`, but also returns an `OptimizeReport` describing what the e-graph optimizer did.
+
+<Expandable title="OptimizeReport fields">
+  <ResponseField name="egglog_program" type="String">
+    The egglog program text used for optimization (for inspection or replay).
+  </ResponseField>
+  <ResponseField name="num_eclasses" type="usize">
+    Number of e-classes after saturation.
+  </ResponseField>
+  <ResponseField name="num_enodes" type="usize">
+    Number of e-nodes after saturation.
+  </ResponseField>
+  <ResponseField name="rules_fired" type="Vec<(String, usize)>">
+    Which rewrite rules fired and how many times each fired.
+  </ResponseField>
+  <ResponseField name="nodes_before" type="usize">
+    Graph node count before optimization.
+  </ResponseField>
+  <ResponseField name="nodes_after" type="usize">
+    Graph node count after optimization (excluding `Nop` dead nodes).
+  </ResponseField>
+  <ResponseField name="fusions_applied" type="Vec<(String, u32)>">
+    List of `(fusion_name, node_index)` pairs for each fusion that fired.
+  </ResponseField>
+  <ResponseField name="egglog_time" type="Duration">
+    Wall-clock time for egglog saturation.
+  </ResponseField>
+  <ResponseField name="extract_time" type="Duration">
+    Wall-clock time for graph extraction and fusion rewrites.
+  </ResponseField>
+</Expandable>
+
+---
+
+## `MemorySummary`
+
+```rust
+pub struct MemorySummary {
+    pub total_buffer_bytes: usize,
+    pub adam_state_bytes: usize,
+    pub num_buffers: usize,
+    pub largest_buffer_bytes: usize,
+}
+```
+
+A snapshot of GPU memory usage for a session.
+
+<ResponseField name="total_buffer_bytes" type="usize">
+  Total bytes across all allocated GPU buffers.
+</ResponseField>
+
+<ResponseField name="adam_state_bytes" type="usize">
+  Bytes used by Adam first- and second-moment buffers (0 if using SGD).
+</ResponseField>
+
+<ResponseField name="num_buffers" type="usize">
+  Number of individual GPU buffers.
+</ResponseField>
+
+<ResponseField name="largest_buffer_bytes" type="usize">
+  Size of the largest single buffer.
+</ResponseField>
+
+`MemorySummary` implements `Display`:
+
+```
+4 buffers, 12.3 MB total (8.2 MB adam state), largest 4.1 MB
+```
+
+---
+
+## `Session` methods
+
+### Data upload
+
+#### `set_input`
+
+```rust
+pub fn set_input(&mut self, name: &str, data: &[f32])
+```
+
+Uploads `f32` data into the named input buffer. Call this before each `step()` or `run()`.
+
+<ParamField path="name" type="&str" required>
+  Must match the name passed to `graph.input()` when building the graph.
+</ParamField>
+<ParamField path="data" type="&[f32]" required>
+  Flat slice of values. Length must match the number of elements in the named input.
+</ParamField>
+
+```rust
+session.set_input("x", &batch_data);
+session.set_input("labels", &batch_labels);
+```
+
+---
+
+#### `set_parameter`
+
+```rust
+pub fn set_parameter(&mut self, name: &str, data: &[f32])
+```
+
+Uploads `f32` data into a named parameter buffer. Use this to initialize weights before training, or to restore a checkpoint manually.
+
+<ParamField path="name" type="&str" required>
+  Must match the name passed to `graph.parameter()`.
+</ParamField>
+<ParamField path="data" type="&[f32]" required>
+  Flat slice of initial values.
+</ParamField>
+
+```rust
+session.set_parameter("w1", &kaiming_init);
+```
+
+<Note>
+  If the parameter feeds a derived (concatenated) weight created by the optimizer, `set_parameter` writes the source data into the correct column offset of the derived buffer automatically.
+</Note>
+
+---
+
+#### `get_parameter` / `read_param`
+
+```rust
+pub fn read_param(&self, name: &str, out: &mut [f32])
+```
+
+Reads the current value of a named parameter buffer back from GPU memory.
+
+<ParamField path="name" type="&str" required>Parameter name.</ParamField>
+<ParamField path="out" type="&mut [f32]" required>Destination slice. Must be large enough to hold all parameter elements.</ParamField>
+
+---
+
+### Optimizer configuration
+
+#### `set_learning_rate`
+
+```rust
+pub fn set_learning_rate(&mut self, lr: f32)
+```
+
+Sets the SGD learning rate for updates fused into the next `step()`. When set, `step()` appends all SGD parameter updates to the same GPU submission as the forward+backward pass — eliminating the overhead of a separate `sgd_step()` call.
+
+<ParamField path="lr" type="f32" required>Learning rate.</ParamField>
+
+```rust
+session.set_learning_rate(0.01);
+session.step();
+session.wait();
+```
+
+---
+
+#### `set_adam`
+
+```rust
+pub fn set_adam(&mut self, lr: f32, beta1: f32, beta2: f32, epsilon: f32)
+```
+
+Sets Adam optimizer parameters for updates fused into the next `step()`. Analogous to `set_learning_rate` for SGD.
+
+<ParamField path="lr" type="f32" required>Learning rate.</ParamField>
+<ParamField path="beta1" type="f32" required>First moment decay (typically `0.9`).</ParamField>
+<ParamField path="beta2" type="f32" required>Second moment decay (typically `0.999`).</ParamField>
+<ParamField path="epsilon" type="f32" required>Numerical stability constant (typically `1e-8`).</ParamField>
+
+```rust
+session.set_adam(1e-3, 0.9, 0.999, 1e-8);
+session.step();
+session.wait();
+```
+
+---
+
+### Execution
+
+#### `step`
+
+```rust
+pub fn step(&mut self)
+```
+
+Executes the full GPU dispatch sequence: forward pass, backward pass, and (if an optimizer was configured) parameter updates — all in a single GPU submission.
+
+Call `wait()` before reading results.
+
+```rust
+session.set_input("x", &data);
+session.set_learning_rate(0.01);
+session.step();
+session.wait();
+let loss = session.read_loss();
+```
+
+---
+
+#### `wait`
+
+```rust
+pub fn wait(&mut self)
+```
+
+Blocks the CPU until any pending GPU work completes. Safe to call even if no work is in flight.
+
+---
+
+#### `run`
+
+<Note>
+  For inference graphs, use `step()` as the forward execution method. The session does not have a separate `run()` method — `step()` works for both training and inference sessions.
+</Note>
+
+---
+
+### Reading outputs
+
+#### `read_loss`
+
+```rust
+pub fn read_loss(&self) -> f32
+```
+
+Reads the scalar loss value from GPU memory. Must be called after `wait()`.
+
+Returns `0.0` if the graph has no loss output.
+
+---
+
+#### `read_output_by_index`
+
+```rust
+pub fn read_output_by_index(&self, index: usize, out: &mut [f32])
+```
+
+Reads a graph output by index into a pre-allocated slice. Index `0` is the primary output. Higher indices correspond to additional outputs set via `graph.set_outputs()`.
+
+<ParamField path="index" type="usize" required>Output index (0-based).</ParamField>
+<ParamField path="out" type="&mut [f32]" required>Destination buffer.</ParamField>
+
+---
+
+#### `num_outputs`
+
+```rust
+pub fn num_outputs(&self) -> usize
+```
+
+Returns the number of graph outputs.
+
+---
+
+### Inspection
+
+#### `plan`
+
+```rust
+pub fn plan(&self) -> &ExecutionPlan
+```
+
+Returns a reference to the compiled execution plan. Useful for inspecting dispatch counts and buffer layouts.
+
+---
+
+#### `memory_summary`
+
+```rust
+pub fn memory_summary(&self) -> MemorySummary
+```
+
+Returns a `MemorySummary` with GPU memory statistics for this session.
+
+```rust
+let summary = session.memory_summary();
+println!("{}", summary);
+// 4 buffers, 12.3 MB total (8.2 MB adam state), largest 4.1 MB
+```
+
+---
+
+### Checkpointing
+
+#### `save_checkpoint`
+
+```rust
+pub fn save_checkpoint(&mut self, path: &std::path::Path) -> std::io::Result<()>
+```
+
+Saves all parameter values, Adam first/second moment buffers, and the Adam step counter to a safetensors file.
+
+```rust
+session.save_checkpoint(Path::new("checkpoint.safetensors"))?;
+```
+
+---
+
+#### `load_checkpoint`
+
+```rust
+pub fn load_checkpoint(&mut self, path: &std::path::Path) -> std::io::Result<()>
+```
+
+Restores parameter values and Adam optimizer state from a safetensors file. The session must have been built from the same graph (same parameter names and sizes).
+
+```rust
+session.load_checkpoint(Path::new("checkpoint.safetensors"))?;
+```
